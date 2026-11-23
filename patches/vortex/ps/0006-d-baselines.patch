@@ -1,0 +1,330 @@
+diff --git a/sim/common/phase_config.h b/sim/common/phase_config.h
+index 82bcb99da..28f797585 100644
+--- a/sim/common/phase_config.h
++++ b/sim/common/phase_config.h
+@@ -70,9 +70,16 @@ struct PhaseConfig {
+   //             schedule may not change bits 8..24 inside a launch)
+   //   bits 15:12 window set-aside ways per set for persisting lines (0 = 3/4 of the ways)
+   //   bits 24:16 window hitRatio numerator out of 256 (0 = 256 = 1.0)
++  //   bits 6:5  phase-ignorant replacement baseline (patch d-baselines, methodology §14.D): 0 off,
++  //             1 SRRIP (2-bit RRPV, insert at 2, hit -> 0), 2 SHiP-Mem-lite (SRRIP + a 3-bit SHCT indexed by the
++  //             16 KiB address region; insert at 3 when the region's counter is 0); 3 reserved. Exclusive with
++  //             bits 1:0, bit 4 and bit 8. Neither policy reads the request class, the ranges or any phase input.
+   // Any other bit set is rejected.
+   static constexpr uint32_t INS_D_MASK = 0x3, INS_D_LRU = 1, INS_D_BYPASS = 2, INS_RTL_FILL = 0x10,
+                             INS_WINDOW = 0x100, INS_WIN_STATIC_MASK = 0x1ffff00, INS_VALID_MASK = 0x1fff113;
++  // PhaseShift (patch d-baselines): bits 6:5 (kept out of INS_VALID_MASK, which stays the kv-insert field set)
++  static constexpr uint32_t INS_REPL_MASK = 0x60, INS_REPL_SRRIP = 0x20, INS_REPL_SHIP = 0x40;
++  uint32_t ins_repl() const { return insert_policy & INS_REPL_MASK; }
+   uint32_t ins_d() const { return insert_policy & INS_D_MASK; }
+   bool ins_rtl_fill() const { return (insert_policy & INS_RTL_FILL) != 0; }
+   bool ins_window() const { return (insert_policy & INS_WINDOW) != 0; }
+@@ -87,10 +94,13 @@ struct PhaseConfig {
+   }
+   // Empty string if valid, else the reason.
+   static const char* insert_policy_error(uint32_t v) {
+-    if (v & ~INS_VALID_MASK) return "reserved bits set";
++    if (v & ~(INS_VALID_MASK | INS_REPL_MASK)) return "reserved bits set";
+     if ((v & INS_D_MASK) == 3) return "D mode 3 is reserved";
+     if ((v & INS_WINDOW) && (v & INS_D_MASK)) return "window baseline and D are exclusive";
+     if (!(v & INS_WINDOW) && (v & 0x1fff000)) return "window fields set without the window bit";
++    if ((v & INS_REPL_MASK) == INS_REPL_MASK) return "replacement baseline 3 is reserved";
++    if ((v & INS_REPL_MASK) && (v & (INS_D_MASK | INS_RTL_FILL | INS_WINDOW)))
++      return "SRRIP / SHiP-Mem-lite are exclusive with D, rtl_like_fill and the window";
+     return "";
+   }
+ 
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+index 94b9e9929..99b895e9a 100644
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -165,6 +165,14 @@ struct line_t {
+   // promote it. ps_persist = window-baseline persisting line. Both false unless the L2 insert policy is non-zero.
+   bool ps_low = false;
+   bool ps_persist = false;
++  // PhaseShift (patch d-baselines, methodology §14.D): SRRIP / SHiP-Mem-lite state, used only when the L2
++  // insert policy selects one of them (PhaseConfig::INS_REPL_*). ps_rrpv = 2-bit re-reference prediction value
++  // (0 near .. 3 distant); a line installed while neither baseline was active carries the SRRIP insertion value 2.
++  // ps_fresh = installed by the current fill and not yet hit by a genuine lookup (replays of the filling chain are the
++  // same access and do not promote, as for ps_low). ps_outcome = SHiP's per-line outcome bit (re-referenced since fill).
++  uint8_t ps_rrpv = 2;
++  bool ps_fresh = false;
++  bool ps_outcome = false;
+ 
+   bool any_valid() const {
+     for (const auto &s : sectors) if (s.valid) return true;
+@@ -178,6 +186,9 @@ struct line_t {
+     lru_ctr = 0;
+     ps_low = false;
+     ps_persist = false;
++    ps_rrpv = 2;
++    ps_fresh = false;
++    ps_outcome = false;
+     for (auto &s : sectors) s.reset();
+   }
+ };
+@@ -377,6 +388,28 @@ struct set_t {
+     return (best != -1) ? best : any_best;
+   }
+ 
++  // PhaseShift (patch d-baselines): RRIP victim [C34]. A free way first (*age = 0); else the lowest way among the valid
++  // lines with the largest RRPV, and *age = 3 - that RRPV = the number of "increment every RRPV" rounds of RRIP's
++  // search loop before a distant (3) line appears. Does NOT mutate state (the fill may still stall); the caller applies
++  // ps_rrip_age(*age) when the fill commits. Equivalent to the paper's loop: incrementing all lines by the same amount
++  // keeps their order, so the first line to reach 3 is the first line holding the maximum.
++  int ps_rrip_victim(uint32_t *age) const {
++    int best = -1;
++    uint32_t best_v = 0;
++    for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
++      const auto &l = lines.at(i);
++      if (!l.any_valid()) { *age = 0; return i; }
++      if (best == -1 || l.ps_rrpv > best_v) { best = i; best_v = l.ps_rrpv; }
++    }
++    *age = 3 - best_v;
++    return best;
++  }
++  void ps_rrip_age(uint32_t age) {
++    if (age == 0) return;
++    for (auto &l : lines)
++      if (l.any_valid()) l.ps_rrpv = uint8_t(std::min<uint32_t>(3, l.ps_rrpv + age));
++  }
++
+   // Find the way currently resident for `tag` (any sector valid), or -1.
+   int find_resident(uint64_t tag) const {
+     for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
+@@ -720,6 +753,50 @@ private:
+   uint8_t ps_new_prio_ = 0;
+ };
+ 
++// PhaseShift (patch d-baselines, methodology §14.D): SHiP-Mem-lite signature history counter table
++// [C35], one per cache (shared by its banks; a 16 KiB region's lines are interleaved over every bank). Signature =
++// the 16 KiB address region (byte address >> 14), direct-mapped into SHIP_ENTRIES 3-bit saturating counters (no
++// hashing: 16 K entries x 16 KiB = 256 MiB of distinct regions before two regions share a counter, more than any
++// footprint). Counters start at SHIP_INIT = 1 at every launch reset (cold caches, §1; kept in persist_l2 mode like the
++// lines): an untrained region is predicted "re-referenced" and inserts like SRRIP, and one dead eviction is enough to
++// make it distant. Instrumentation (observation only, SHiP-Mem-lite runs only): the first fill that uses an entry
++// prints "PSSHCT first", the first time an entry reaches 0 prints "PSSHCT zero", and every flush (end of a launch)
++// prints "PSSHCT dump" for every entry used in the launch.
++struct PsShct {
++  static constexpr uint32_t SHIP_REGION_BITS = 14, SHIP_ENTRIES = 16384, SHIP_MAX = 7, SHIP_INIT = 1;
++  std::vector<uint8_t> ctr = std::vector<uint8_t>(SHIP_ENTRIES, SHIP_INIT);
++  std::vector<uint8_t> seen = std::vector<uint8_t>(SHIP_ENTRIES, 0);   // bit 0 used, bit 1 has reached 0
++  bool used = false;                                                    // any entry used since the last reset
++  bool dumped = false;                                                  // dumped since the last reset
++  static uint32_t index(uint64_t addr) { return uint32_t(addr >> SHIP_REGION_BITS) & (SHIP_ENTRIES - 1); }
++  void reset() {
++    std::fill(ctr.begin(), ctr.end(), uint8_t(SHIP_INIT));
++    std::fill(seen.begin(), seen.end(), uint8_t(0));
++    used = false;
++    dumped = false;
++  }
++  void use(uint32_t i, uint64_t cycle) {
++    if (!(seen[i] & 1)) {
++      seen[i] |= 1;
++      used = true;
++      std::cout << "PSSHCT first idx=" << i << " cycle=" << cycle << " val=" << uint32_t(ctr[i]) << std::endl;
++    }
++  }
++  void inc(uint32_t i) { if (ctr[i] < SHIP_MAX) ++ctr[i]; }
++  void dec(uint32_t i, uint64_t cycle) {
++    if (ctr[i] > 0) --ctr[i];
++    if (ctr[i] == 0 && !(seen[i] & 2)) {
++      seen[i] |= 2;
++      std::cout << "PSSHCT zero idx=" << i << " cycle=" << cycle << std::endl;
++    }
++  }
++  void dump(uint64_t cycle) const {
++    for (uint32_t i = 0; i < SHIP_ENTRIES; ++i)
++      if (seen[i] & 1)
++        std::cout << "PSSHCT dump idx=" << i << " val=" << uint32_t(ctr[i]) << " cycle=" << cycle << std::endl;
++  }
++};
++
+ class CacheBank : public SimObject<CacheBank> {
+ public:
+   // A memory-side request leaves the bank through a queue with a registered
+@@ -779,6 +856,31 @@ public:
+   }
+   void ps_count_bypass(uint32_t cls) { ++mshr_.ps_stats_.fill_bypassed[cls & (VX_PS_NUM_CLASSES - 1)]; }
+ 
++  // PhaseShift (patch d-baselines): the cache-wide SHCT (set by Cache::Impl).
++  void ps_set_shct(PsShct *t) { ps_shct_ = t; }
++  // PhaseShift (patch d-baselines): SRRIP / SHiP-Mem-lite selected in the L2 insert word (0 = neither).
++  uint32_t ps_repl() const {
++    return (ps_owner_ != nullptr) ? (ps_owner_->ps_insert() & PhaseConfig::INS_REPL_MASK) : 0u;
++  }
++  // PhaseShift (patch d-baselines): RRIP hit update for a committed lookup (called next to every update_lru()).
++  // A hit sets RRPV = 0 (hit-priority promotion [C34]); with SHiP it also sets the line's outcome bit and increments
++  // the SHCT entry of the line's region [C35]. A miss (hit_id -1) changes nothing here (RRIP ages only when a victim
++  // is searched). A replay of the chain that filled a still-fresh line is the same access and is ignored.
++  void ps_repl_hit(set_t &set, uint32_t set_id, int hit_id, bool replay) {
++    const uint32_t r = this->ps_repl();
++    if (r == 0 || hit_id < 0)
++      return;
++    auto &l = set.lines.at(hit_id);
++    if (replay && l.ps_fresh)
++      return;
++    l.ps_fresh = false;
++    l.ps_rrpv = 0;
++    if (r == PhaseConfig::INS_REPL_SHIP) {
++      l.ps_outcome = true;
++      ps_shct_->inc(PsShct::index(params_.mem_addr_sector(bank_id_, set_id, l.tag, 0)));
++    }
++  }
++
+   // PhaseShift (patch sched-replay): drop every line of this bank holding `addr` (any sector), dirty or not. Called
+   // only between launches in persist mode, for host writes to device memory (the flush that follows every launch
+   // has already written back and cleaned every dirty line). Returns the number of lines dropped.
+@@ -1190,13 +1292,18 @@ private:
+     }
+ 
+     int line_id;
++    // PhaseShift (patch d-baselines): SRRIP / SHiP-Mem-lite (phase-ignorant: no class, range or phase input).
++    const uint32_t ps_repl = ps_ins & PhaseConfig::INS_REPL_MASK;
++    uint32_t ps_rrip_age = 0;
+     uint32_t ps_victim_age = 0;   // PhaseShift (patch kv-insert): replacement state of the way before this fill
+     if (is_refill) {
+       line_id = resident_id; // add a sector to the resident copy; no eviction
+       ps_victim_age = set.lines.at(resident_id).lru_ctr;
+     } else {
+       int32_t free_id = -1, repl_id = 0;
+-      if (ps_ins != 0 && ps_owner_->phase_config().ins_window()) {
++      if (ps_repl != 0) {
++        line_id = set.ps_rrip_victim(&ps_rrip_age);   // PhaseShift (patch d-baselines)
++      } else if (ps_ins != 0 && ps_owner_->phase_config().ins_window()) {
+         line_id = set.ps_window_victim(ps_win_persist, ps_owner_->phase_config().ins_win_ways(set.lines.size()));
+       } else {
+         line_id = set.select_victim(config_.repl_policy, rand_ctr_, &free_id, &repl_id);
+@@ -1244,6 +1351,14 @@ private:
+ 
+       // Repurpose the victim way for the new line: all sectors invalid.
+       ps_victim_age = victim_line.lru_ctr;   // PhaseShift (patch kv-insert): rtl_like_fill keeps the way's state
++      if (ps_repl != 0) {
++        // PhaseShift (patch d-baselines): commit the RRIP search's aging; SHiP: a valid victim evicted without a
++        // re-reference since its fill (outcome 0) decrements its region's counter [C35].
++        if (ps_repl == PhaseConfig::INS_REPL_SHIP && victim_line.any_valid() && !victim_line.ps_outcome)
++          ps_shct_->dec(PsShct::index(params_.mem_addr_sector(bank_id_, set_id, victim_line.tag, 0)),
++                        SimPlatform::instance().cycles());
++        set.ps_rrip_age(ps_rrip_age);
++      }
+       victim_line.reset();
+       victim_line.tag = addr_tag;
+     }
+@@ -1265,6 +1380,24 @@ private:
+       }
+       if (!is_refill)
+         line.ps_persist = ps_win_persist;
++      if (ps_repl != 0 && !is_refill) {
++        // PhaseShift (patch d-baselines): SRRIP inserts at RRPV 2 ("long" re-reference interval, [C34]); SHiP-Mem-lite
++        // inserts at 3 ("distant") when the region's SHCT counter is 0, else 2 [C35]. A distant insertion is counted
++        // as a demoted fill (by the fill's class, accounting only). A refill (sector added to a resident line) keeps
++        // the line's state.
++        uint8_t v = 2;
++        if (ps_repl == PhaseConfig::INS_REPL_SHIP) {
++          const uint32_t si = PsShct::index(bank_req.addr);
++          ps_shct_->use(si, SimPlatform::instance().cycles());
++          if (ps_shct_->ctr[si] == 0) {
++            v = 3;
++            ++mshr_.ps_stats_.fill_demoted[ps_cls & (VX_PS_NUM_CLASSES - 1)];
++          }
++        }
++        line.ps_rrpv = v;
++        line.ps_fresh = true;
++        line.ps_outcome = false;
++      }
+     }
+     auto &sec    = line.sectors.at(sector_id);
+     sec.valid      = true;
+@@ -1629,6 +1762,7 @@ private:
+           return; // stall
+         if (config_.repl_policy == Cache::PLRU)
+           set.update_lru(hit_id);
++        this->ps_repl_hit(set, set_id, hit_id, true);   // PhaseShift (patch d-baselines)
+         pipe_req_->pop();
+         return;
+       }
+@@ -1674,6 +1808,7 @@ private:
+       // insert policy is non-zero, so the stock path is unchanged).
+       if (config_.repl_policy == Cache::PLRU)
+         set.update_lru(set.lines.at(hit_id).ps_low ? -1 : hit_id);
++      this->ps_repl_hit(set, set_id, hit_id, true);   // PhaseShift (patch d-baselines)
+ 
+       pipe_req_->pop();
+     } break;
+@@ -1736,6 +1871,7 @@ private:
+             return; // stall
+           if (config_.repl_policy == Cache::PLRU)
+             set.update_lru(hit_id);
++          this->ps_repl_hit(set, set_id, hit_id, false);   // PhaseShift (patch d-baselines)
+           --pending_mshr_size_;
+           this->pipeLineErase(set_id, addr_tag);
+           pipe_req_->pop();
+@@ -1855,6 +1991,7 @@ private:
+ 
+       if (config_.repl_policy == Cache::PLRU)
+         set.update_lru(hit_id);
++      this->ps_repl_hit(set, set_id, hit_id, false);   // PhaseShift (patch d-baselines)
+       --pending_mshr_size_;
+       this->pipeLineErase(set_id, addr_tag);
+       pipe_req_->pop();
+@@ -1954,6 +2091,7 @@ private:
+   // Flush walk state.
+   bool     flushing_;
+   const Cache *ps_owner_ = nullptr;   // PhaseShift (patch sched-replay), see ps_set_owner()
++  PsShct *ps_shct_ = nullptr;         // PhaseShift (patch d-baselines), see ps_set_shct()
+   uint32_t flush_set_idx_;
+   uint32_t flush_way_idx_;
+   uint32_t flush_sector_idx_;
+@@ -2038,6 +2176,7 @@ public:
+       snprintf(sname, 100, "%s-bank%d", simobject->name().c_str(), i);
+       banks_.at(i) = CacheBank::Create(sname, config, params_, i);
+       banks_.at(i)->ps_set_owner(simobject);   // PhaseShift (patch sched-replay)
++      banks_.at(i)->ps_set_shct(&ps_shct_);    // PhaseShift (patch d-baselines)
+ 
+       // bind core ports
+       bank_core_xbar_->ReqOut.at(i).bind(&banks_.at(i)->core_req_in);
+@@ -2057,6 +2196,8 @@ public:
+     // kept, CacheBank::on_reset()).
+     init_cycles_ = simobject_->ps_persist_active() ? 0 : params_.sets_per_bank;
+     ps_written_.clear();   // PhaseShift (patch kv-insert)
++    if (!simobject_->ps_persist_active())
++      ps_shct_.reset();    // PhaseShift (patch d-baselines): predictor state is cold per launch like the lines
+   }
+ 
+   // PhaseShift (patch sched-replay): drop every line overlapping [addr, addr + size) (line granularity).
+@@ -2178,6 +2319,12 @@ public:
+ 
+   void flush_begin() {
+     if (config_.bypass) return;
++    // PhaseShift (patch d-baselines): end-of-launch SHCT dump (only if SHiP-Mem-lite used the table this launch; a
++    // schedule-selected policy is already switched back to the host word at the flush; observation only)
++    if (ps_shct_.used && !ps_shct_.dumped) {   // once per launch (the processor may re-issue flush_begin)
++      ps_shct_.dump(SimPlatform::instance().cycles());
++      ps_shct_.dumped = true;
++    }
+     for (auto &bank : banks_) {
+       bank->flush_begin();
+     }
+@@ -2227,6 +2374,7 @@ private:
+   MemCrossBar::Ptr bank_core_xbar_;
+   uint32_t init_cycles_;
+   std::unordered_set<uint64_t> ps_written_;   // PhaseShift (patch kv-insert): lines written this launch (D bypass)
++  PsShct ps_shct_;                             // PhaseShift (patch d-baselines): SHiP-Mem-lite SHCT
+ };
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+diff --git a/sim/simx/mem/cache.h b/sim/simx/mem/cache.h
+index b8a283f9d..183020f27 100644
+--- a/sim/simx/mem/cache.h
++++ b/sim/simx/mem/cache.h
+@@ -82,7 +82,9 @@ public:
+ 	//                  only where ps_count_link_inputs() was called (the L2s: the L1/DXA -> L2 link)
+ 	//   fill_demoted/bypassed[c]  fills inserted at low priority (D insert-at-LRU, or a window-baseline streaming
+ 	//                  line) / read requests sent around the L2 without allocation (D bypass), by the fill's /
+-	//                  request's class (patch kv-insert, 0 unless the L2 insert policy is non-zero)
++	//                  request's class (patch kv-insert, 0 unless the L2 insert policy is non-zero); patch
++	//                  d-baselines also counts SHiP-Mem-lite distant (RRPV 3) insertions as demoted fills
++	//                  (by the fill's class; accounting only, the policy itself never reads the class)
+ 	struct PsClassStats {
+ 		uint64_t reqs[VX_PS_NUM_CLASSES] = {};
+ 		uint64_t mixed_merges = 0;

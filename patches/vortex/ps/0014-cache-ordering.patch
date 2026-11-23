@@ -1,0 +1,368 @@
+PhaseShift ps patch 0014-cache-ordering (2026-11-10). SimX CacheBank same-sector ordering fix (docs/vortex_errata.md
+item 38; methodology §18.6). Stock defect: MSHR::dequeue() frees a replay's entry when the replay enters the bank pipe, so a
+Core request ahead of it in the pipe performs first (WAR/WAW/RAW), and the fill-forward drain can answer a read ahead of an
+older in-pipe write. Fix: replay-entry gate + forward gate (conflict = same sector, >= 1 store/atomic, store/store only on
+overlapping bytes); env-gated read-only order checker PS_ORDER_CHECK=1. The base tree carries the identical code
+(patches/vortex/base/0014-cache-ordering.patch).
+
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -13,6 +13,9 @@
+ 
+ #include <unordered_set>
+ #include "cache.h"
++#include <cstdlib>   // PhaseShift (patch cache-ordering, errata 38)
++#include <deque>
++#include <iostream>
+ #include "mem_block_pool.h"
+ #include "debug.h"
+ #include "types.h"
+@@ -1116,6 +1119,7 @@
+   // write-through caches have nothing to evict). flush_done() reports when the
+   // walk finishes AND the cache is otherwise idle.
+   void flush_begin() {
++    this->ord_summary("flush");   // PhaseShift (patch cache-ordering, errata 38)
+     if (!config_.write_back) {
+       flushing_ = false;
+       flush_set_idx_ = 0;
+@@ -1146,6 +1150,9 @@
+     pending_amo_probes_ = 0;
+     pipe_fill_count_ = 0;
+     pipe_core_lines_.clear();
++    this->ord_summary("reset");   // PhaseShift (patch cache-ordering, errata 38)
++    ord_pipe_.clear(); ord_live_.clear();
++    ord_holds_ = ord_fwd_blocks_ = ord_checks_ = ord_viol_ = ord_printed_ = 0;
+     pending_read_reqs_ = 0;
+     pending_write_reqs_ = 0;
+     pending_fill_reqs_ = 0;
+@@ -1233,10 +1240,16 @@
+     // 1) replay: one chain entry leaves per tick — when the fill-forward
+     // drain completed the head this tick, this slot goes to new core
+     // requests instead
++    // PhaseShift (patch cache-ordering, errata 38): a ready replay must not enter the pipe behind a conflicting
++    // Core request (that request would perform first); hold every input this tick instead.
++    if (mshr_.has_ready_reqs() && this->ord_replay_held()) {
++      ++ord_holds_;
++      return;
++    }
+     if (mshr_.has_ready_reqs() && !fwd_consumed) {
+       bank_req_t bank_req;
+       mshr_.dequeue(&bank_req);
+-      pipe_req_->push(bank_req);
++      this->pipe_push(bank_req);
+       DT(3, this->name() << " replay-deq: " << bank_req);
+       return;
+     }
+@@ -1283,7 +1296,7 @@
+       bank_req.mshr_id = mshr_id;
+       bank_req.data    = mem_rsp.data;
+       bank_req.flags.mem_class = root_peek.bank_req.flags.mem_class;   // PhaseShift: the fill's (first requester's) class
+-      pipe_req_->push(bank_req);
++      this->pipe_push(bank_req);
+       ++pipe_fill_count_;
+       DT(3, this->name() << " fill-rsp: " << mem_rsp);
+       this->mem_rsp_in.pop();
+@@ -1397,6 +1410,7 @@
+             ++mshr_.ps_stats_.reqs[coalesced.flags.mem_class];   // PhaseShift (patch mem-class)
+             assert(!mshr_.full());
+             int id = mshr_.enqueue(coalesced, adm_set_id, adm_addr_tag, adm_sector);
++            if (ord_check_on()) this->ord_admit(coalesced);   // PhaseShift (patch cache-ordering, errata 38) (checker)
+             // Drain-only join (ordering case): nothing will mark our entry —
+             // make it replay-ready ourselves, seq-ordered behind the
+             // in-flight replays.
+@@ -1439,7 +1453,7 @@
+       bank_req.amo_cmp = core_req.amo_cmp;
+       bank_req.flags   = core_req.flags;
+       ++mshr_.ps_stats_.reqs[bank_req.flags.mem_class];   // PhaseShift (patch mem-class)
+-      pipe_req_->push(bank_req);
++      this->pipe_push(bank_req);
+       DT(3, this->name() << " core-req: " << core_req);
+       // pending_mshr_size_ tracks Core-typed in-flight requests so the
+       // MSHR pre-reservation in processInputs is conservative. AmoProbe
+@@ -1681,11 +1695,17 @@
+       fwd_active_ = false;
+       return false;
+     }
++    // PhaseShift (patch cache-ordering, errata 38): an older conflicting request still in the pipe must perform first.
++    if (this->ord_forward_blocked(head->bank_req)) {
++      ++ord_fwd_blocks_;
++      return false; // the head falls back to the replay path
++    }
+     if (crsp_sent_ || this->core_rsp_out.full()) {
+       return false; // the head falls back to the replay path this tick
+     }
+     bank_req_t req;
+     mshr_.dequeue(&req);
++    this->ord_perform(req, "fwd");   // PhaseShift (patch cache-ordering, errata 38) (checker)
+     MemRsp rsp{req.req_tag, req.hart_id, req.uuid};
+     rsp.data = set.lines.at(present_id).sectors.at(sector_id).data;
+     this->core_rsp_out.send(rsp);
+@@ -1843,7 +1863,7 @@
+ 
+     switch (bank_req.type) {
+     case bank_req_t::None:
+-      pipe_req_->pop();
++      this->pipe_pop();
+       return;
+ 
+ #if VX_CFG_EXT_A_ENABLED
+@@ -1923,7 +1943,8 @@
+       DT(3, this->name() << " amo-probe-fwd: " << amo_fwd);
+       ++pending_fill_reqs_; // counts as an outstanding mem-roundtrip for perf
+       --pending_amo_probes_; // reservation transferred to the table entry
+-      pipe_req_->pop();
++      this->ord_perform(bank_req, "amo-probe");   // PhaseShift (patch cache-ordering, errata 38) (checker)
++      this->pipe_pop();
+       return;
+     }
+ #endif
+@@ -1934,7 +1955,7 @@
+       }
+       assert(pipe_fill_count_ != 0);
+       --pipe_fill_count_;
+-      pipe_req_->pop();
++      this->pipe_pop();
+     } break;
+ 
+     case bank_req_t::Replay: {
+@@ -1957,7 +1978,8 @@
+         // A write-through merge already propagated its store downstream at
+         // miss time, so a vanished line needs no replay — drop it.
+         if (bank_req.write && bank_req.skip_core_rsp) {
+-          pipe_req_->pop();
++          this->ord_perform(bank_req, "replay-drop");   // PhaseShift (patch cache-ordering, errata 38) (checker)
++          this->pipe_pop();
+           return;
+         }
+         // Load / AMO: the sector must be re-fetched before the access can
+@@ -1984,7 +2006,7 @@
+           this->mem_req_out.send(fill, MEM_REQ_DELAY);
+           ++pending_fill_reqs_;
+         }
+-        pipe_req_->pop();
++        this->pipe_pop();
+         return;
+       }
+ 
+@@ -1993,16 +2015,18 @@
+         assert(config_.is_llc && "AMO replay reached non-LLC bank");
+         if (!this->commitAmo(bank_req, set, hit_id, set_id))
+           return; // stall
++        this->ord_perform(bank_req, "replay-amo");   // PhaseShift (patch cache-ordering, errata 38) (checker)
+         if (config_.repl_policy == Cache::PLRU)
+           set.update_lru(hit_id);
+         this->ps_repl_hit(set, set_id, hit_id, true);   // PhaseShift (patch d-baselines)
+-        pipe_req_->pop();
++        this->pipe_pop();
+         return;
+       }
+ #endif
+ 
+       if (need_core_rsp(bank_req) && this->core_rsp_out.full())
+         return; // stall
++      this->ord_perform(bank_req, "replay");   // PhaseShift (patch cache-ordering, errata 38) (checker)
+ 
+       auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
+       if (bank_req.write) {
+@@ -2043,7 +2067,7 @@
+         set.update_lru(set.lines.at(hit_id).ps_low ? -1 : hit_id);
+       this->ps_repl_hit(set, set_id, hit_id, true);   // PhaseShift (patch d-baselines)
+ 
+-      pipe_req_->pop();
++      this->pipe_pop();
+     } break;
+ 
+     case bank_req_t::Core: {
+@@ -2095,7 +2119,7 @@
+           this->ps_ucp_observe(set_id, addr_tag, bank_req.flags.mem_class);   // PhaseShift (patch a-baselines): UMON
+           --pending_mshr_size_;
+           this->pipeLineErase(set_id, addr_tag);
+-          pipe_req_->pop();
++          this->pipe_pop();
+           return;
+         }
+ #if VX_CFG_EXT_A_ENABLED
+@@ -2103,12 +2127,13 @@
+           assert(config_.is_llc && "AMO Core+hit reached non-LLC bank");
+           if (!this->commitAmo(bank_req, set, hit_id, set_id))
+             return; // stall
++          this->ord_perform(bank_req, "hit-amo");   // PhaseShift (patch cache-ordering, errata 38) (checker)
+           if (config_.repl_policy == Cache::PLRU)
+             set.update_lru(hit_id);
+           this->ps_repl_hit(set, set_id, hit_id, false);   // PhaseShift (patch d-baselines)
+           --pending_mshr_size_;
+           this->pipeLineErase(set_id, addr_tag);
+-          pipe_req_->pop();
++          this->pipe_pop();
+           return;
+         }
+ #endif
+@@ -2119,6 +2144,7 @@
+           return;
+         if (need_rsp && this->core_rsp_out.full())
+           return;
++        this->ord_perform(bank_req, "hit");   // PhaseShift (patch cache-ordering, errata 38) (checker)
+ 
+         auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
+         if (bank_req.write) {
+@@ -2189,6 +2215,8 @@
+             mshr_.enqueue(merge_req, set_id, addr_tag, sector_id);
+             DT(3, this->name() << " mshr-enqueue (wt-merge): " << bank_req);
+           }
++          if (!fill_pending)
++            this->ord_perform(bank_req, "wt-miss");   // PhaseShift (patch cache-ordering, errata 38) (checker)
+         } else {
+           // Read miss, or write-back write miss → MSHR-backed.
+           // First miss for this line sends the fill request; subsequent
+@@ -2229,7 +2257,7 @@
+       this->ps_ucp_observe(set_id, addr_tag, bank_req.flags.mem_class);   // PhaseShift (patch a-baselines): UMON
+       --pending_mshr_size_;
+       this->pipeLineErase(set_id, addr_tag);
+-      pipe_req_->pop();
++      this->pipe_pop();
+     } break;
+ 
+     default:
+@@ -2297,6 +2325,130 @@
+   // AMO admission defer) must consult this mirror as well.
+   std::vector<std::pair<uint32_t, uint64_t>> pipe_core_lines_;
+ 
++  // PhaseShift (patch cache-ordering, errata 38)
++  // Ordering of same-sector accesses inside the bank. See errata 38 and results/<run>/README.md.
++  // ord_pipe_ mirrors pipe_req_ (one entry per request, pushed and popped with it). ord_live_ is the order checker's
++  // record of admitted-but-unperformed accesses per sector (only with PS_ORDER_CHECK=1).
++  struct ord_ent_t {
++    uint64_t key;      // sector address
++    uint64_t seq;      // adm_seq
++    uint64_t byteen;
++    uint8_t  type;     // bank_req_t::ReqType
++    bool     wr;       // plain store
++    bool     amo;      // atomic
++  };
++  std::deque<ord_ent_t> ord_pipe_;
++  std::unordered_map<uint64_t, std::vector<ord_ent_t>> ord_live_;
++  uint64_t ord_holds_ = 0, ord_fwd_blocks_ = 0, ord_checks_ = 0, ord_viol_ = 0, ord_printed_ = 0;
++  static bool ord_fix_on() {
++    return true;
++  }
++  static bool ord_check_on() {
++    static int v = -1;
++    if (v < 0) { const char* e = std::getenv("PS_ORDER_CHECK"); v = (e && e[0] && std::strcmp(e, "0") != 0) ? 1 : 0; }
++    return v == 1;
++  }
++  uint64_t ord_key(uint64_t addr) const {
++    return params_.mem_addr_sector(bank_id_, params_.addr_set_id(addr), params_.addr_tag(addr), params_.addr_sector_id(addr));
++  }
++  ord_ent_t ord_ent(const bank_req_t &r) const {
++    ord_ent_t e;
++    e.key = this->ord_key(r.addr);
++    e.seq = r.adm_seq;
++    e.byteen = r.byteen;
++    e.type = uint8_t(r.type);
++    e.wr = r.write;
++    e.amo = memop_is_atomic(r.op) || (r.type == bank_req_t::AmoProbe);
++    return e;
++  }
++  // Two same-sector accesses must perform in admission order iff this is true (see the file header of
++  // results/<run>/instr/apply_fix.py): any atomic; never two loads; two stores only if their bytes overlap (a zero
++  // byteen counts as the whole sector); a load and a store always (a load's footprint is the sector).
++  static bool ord_conflict(const ord_ent_t &a, const ord_ent_t &b) {
++    if (a.amo || b.amo) return true;
++    if (!a.wr && !b.wr) return false;
++    if (a.wr && b.wr) return (a.byteen == 0 || b.byteen == 0 || (a.byteen & b.byteen) != 0);
++    return true;
++  }
++  void pipe_push(const bank_req_t &r) {
++    pipe_req_->push(r);
++    ord_pipe_.push_back(this->ord_ent(r));
++    if (ord_pipe_.size() != pipe_req_->size()) {
++      std::cerr << "PSORDER fatal: pipe mirror out of sync in " << this->name() << std::endl;
++      std::abort();
++    }
++    if ((r.type == bank_req_t::Core || r.type == bank_req_t::AmoProbe) && ord_check_on())
++      this->ord_admit(r);
++  }
++  void pipe_pop() {
++    if (ord_pipe_.empty()) {
++      std::cerr << "PSORDER fatal: pipe mirror underflow in " << this->name() << std::endl;
++      std::abort();
++    }
++    ord_pipe_.pop_front();
++    pipe_req_->pop();
++  }
++  // Gate G: true if the oldest ready replay must not enter the pipe this tick.
++  bool ord_replay_held() const {
++    if (!ord_fix_on()) return false;
++    const auto *h = mshr_.peek_next_replay();
++    if (h == nullptr) return false;
++    const ord_ent_t he = this->ord_ent(h->bank_req);
++    for (const auto &e : ord_pipe_) {
++      if ((e.type == bank_req_t::Core || e.type == bank_req_t::AmoProbe) && e.key == he.key && ord_conflict(e, he))
++        return true;
++    }
++    return false;
++  }
++  // Gate F: true if the chain head must not be forwarded this tick.
++  bool ord_forward_blocked(const bank_req_t &h) const {
++    if (!ord_fix_on()) return false;
++    const ord_ent_t he = this->ord_ent(h);
++    for (const auto &e : ord_pipe_) {
++      if (e.type != bank_req_t::Fill && e.key == he.key && e.seq < he.seq && ord_conflict(e, he))
++        return true;
++    }
++    return false;
++  }
++  // ---- order checker (PS_ORDER_CHECK=1; read-only) ----
++  void ord_admit(const bank_req_t &r) {
++    const ord_ent_t e = this->ord_ent(r);
++    ord_live_[e.key].push_back(e);
++  }
++  void ord_perform(const bank_req_t &r, const char* where) {
++    if (!ord_check_on()) return;
++    const ord_ent_t a = this->ord_ent(r);
++    auto it = ord_live_.find(a.key);
++    if (it == ord_live_.end()) return;   // admitted before the checker saw it (cannot happen after a reset)
++    auto &v = it->second;
++    ++ord_checks_;
++    for (const auto &b : v) {
++      if (b.seq < a.seq && ord_conflict(a, b)) {
++        ++ord_viol_;
++        if (ord_printed_ < 20) {
++          ++ord_printed_;
++          std::cout << "PSORDER violation bank=" << this->name() << " at=" << where << " sector=0x" << std::hex << a.key
++                    << std::dec << " perform_seq=" << a.seq << " kind=" << (a.amo ? "amo" : (a.wr ? "st" : "ld"))
++                    << " older_unperformed_seq=" << b.seq << " kind=" << (b.amo ? "amo" : (b.wr ? "st" : "ld"))
++                    << " cycle=" << SimPlatform::instance().cycles() << std::endl;
++        }
++        break;
++      }
++    }
++    for (auto i = v.begin(); i != v.end(); ++i) {
++      if (i->seq == a.seq) { v.erase(i); break; }
++    }
++    if (v.empty()) ord_live_.erase(it);
++  }
++  void ord_summary(const char* when) {
++    if (!ord_check_on() || (ord_checks_ == 0 && ord_holds_ == 0 && ord_fwd_blocks_ == 0)) return;
++    uint64_t live = 0;
++    for (const auto &kv : ord_live_) live += kv.second.size();
++    std::cout << "PSORDER bank=" << this->name() << " when=" << when << " checks=" << ord_checks_
++              << " violations=" << ord_viol_ << " holds=" << ord_holds_ << " fwd_blocks=" << ord_fwd_blocks_
++              << " live=" << live << std::endl;
++  }
++
+   void pipeLineErase(uint32_t set_id, uint64_t addr_tag) {
+     for (auto it = pipe_core_lines_.begin(); it != pipe_core_lines_.end(); ++it) {
+       if (it->first == set_id && it->second == addr_tag) {
+@@ -2351,6 +2503,10 @@
+   uint32_t amo_passthru_tag_base() const { return mshr_.capacity(); }
+ #endif
+ 
++public:
++  ~CacheBank() { this->ord_summary("exit"); }   // PhaseShift (patch cache-ordering, errata 38)
++
++private:
+   friend class SimObject<CacheBank>;
+ };
+ 

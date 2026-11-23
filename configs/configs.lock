@@ -1,0 +1,15 @@
+# PhaseShift pinned HF config.json files. Written by scripts/fetch.py hf-config.
+# Revision = Hub commit SHA at fetch time; config URL = https://huggingface.co/<repo>/resolve/<sha>/config.json
+# repo	sha	sha256	licence	gated	date	path
+unsloth/Llama-3.2-1B	9535bd9b1d1dea6acafbdc4813b728796aeb28da	8f028e2cd88148fad38c7dece460947681adf6178e46e11ece9742aa49b378dd	llama3.2	false	2026-10-31T00:27:57Z	configs/unsloth__Llama-3.2-1B.json
+unsloth/Meta-Llama-3.1-8B	e9a141a2091ea561b96483212645a2a05e6f99fc	0ea2186ccf686654fea498aae830b9de201334432b24b07f031d80b76dd928f0	llama3.1	false	2026-10-31T00:28:11Z	configs/unsloth__Meta-Llama-3.1-8B.json
+mistralai/Mistral-7B-v0.1	27d67f1b5f57dc0953326b2601d68371d40ea8da	cf25cdf4719f181d1d1d371973285d9afe9afde0d0c6a6fd48de857555ce1e0d	apache-2.0	false	2026-10-31T00:28:17Z	configs/mistralai__Mistral-7B-v0.1.json
+Qwen/Qwen2.5-7B	d149729398750b98c0af14eb82c78cfe92750796	267ce68584c5f24c3b267d934db2de68dd21d1ca677fb78ed809eb60067f7642	apache-2.0	false	2026-10-31T00:28:37Z	configs/Qwen__Qwen2.5-7B.json
+Qwen/Qwen2.5-7B-Instruct-1M	e28526f7bb80e2a9c8af03b831a9af3812f18fba	3836d4f7ef434824ffbe23d3a7eefbdd1a40f4db9809f9a69a3f9d26d3f2152e	apache-2.0	false	2026-10-31T00:28:55Z	configs/Qwen__Qwen2.5-7B-Instruct-1M.json
+Qwen/Qwen2.5-32B	1818d35814b8319459f4bd55ed1ac8709630f003	2c003fe40b13d2d1f372254d77177ed753176150f3d424d1b5ad22ff1d78a987	apache-2.0	false	2026-10-31T00:29:18Z	configs/Qwen__Qwen2.5-32B.json
+unsloth/Meta-Llama-3.1-70B	1b7306651142d0cc65d993076a250a6a82cf046c	eb24f00e437ef9e63e2650d107e03131c5ea0b8a26d609330e5c3259129f9f33	llama3.1	false	2026-10-31T00:29:39Z	configs/unsloth__Meta-Llama-3.1-70B.json
+allenai/OLMoE-1B-7B-0924	6d84c48581ece794365f2b8e9cfb043c68ade9c5	3643aa880d2f1c9b418156269ae791c73e5612d6b6b6fde0724d927cf89b6335	apache-2.0	false	2026-10-31T00:29:57Z	configs/allenai__OLMoE-1B-7B-0924.json
+deepseek-ai/DeepSeek-V2-Lite	604d5664dddd88a0433dbae533b7fe9472482de0	f346286b0f1c8b044252fd54cb4fa78b9fab6472a6e8bebb9edfe03d414ea03d	other	false	2026-10-31T00:30:03Z	configs/deepseek-ai__DeepSeek-V2-Lite.json
+HuggingFaceTB/SmolLM2-135M	93efa2f097d58c2a74874c7e644dbc9b0cee75a2	1d556eab73b69c7f11f64c557a2f9c6f440bd4c6b89bb2584a6b498c92603843	apache-2.0	false	2026-10-31T00:30:18Z	configs/HuggingFaceTB__SmolLM2-135M.json
+Qwen/Qwen3-30B-A3B	ad44e777bcd18fa416d9da3bd8f70d33ebb85d39	2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297	apache-2.0	false	2026-10-31T00:30:30Z	configs/Qwen__Qwen3-30B-A3B.json
+mistralai/Mixtral-8x7B-v0.1	fc7ac94680e38d7348cfa806e51218e6273104b0	9d56d04b36d0fd12ff54ae4c5bac769cc176e254e64ff71144614b6318b40793	apache-2.0	false	2026-10-31T00:30:42Z	configs/mistralai__Mixtral-8x7B-v0.1.json

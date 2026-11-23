@@ -1,0 +1,15 @@
+PhaseShift: bug fix, stale pf_late bit on MSHR slot reuse. Applies after 0001, 0002, 0003.
+MSHR::dequeue frees a slot by setting bank_req.type = None only, and MSHR::enqueue slot allocation (0001) assigned bank_req/set/tag/sector/line/seq/ps_chain_prio but never pf_late; entry.reset() runs only on a full MSHR reset (per launch). Every chain rooted in a slot that once held a late prefetch therefore started with pf_late = true: the fill counted it as "late" (sector installed untagged, never useful) and 0003 re-arm suppressed (guard !first->pf_late).
+Fix: clear pf_late on slot allocation (unconditional, a bug fix; no env knob). Audit of the per-entry state added by 0001/0003: pf_late (fixed here); bank_req.pf is part of bank_req and is overwritten by the whole-struct assignment on allocation (safe); ps_chain_prio is assigned on allocation (safe); sector tag ps_pf is a cache-line sector bit, cleared on hit-touch/evict/reset, not MSHR state (safe); ps_rearm_q_ is a drain queue, emptied every tick (safe).
+Consequence: trees with 0004 (psall4) differ from psall2/psall3 even with the prefetcher ON (prefetch counters and cycles change, with or without the 32-entry MSHR); with the prefetcher off (PS_PF_DEPTH unset) pf_late is never set, so cycles are identical.
+
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -720,6 +720,7 @@
+         entry.line_id = 0; // victim is selected at Fill time
+         entry.seq = bank_req.adm_seq;
+         entry.ps_chain_prio = ps_new_prio_;
++        entry.pf_late = false;   // PhaseShift (patch l2-pf-late-reset): slot reuse must not inherit a previous chain's late bit
+         ++size_;
+         return i;
+       }

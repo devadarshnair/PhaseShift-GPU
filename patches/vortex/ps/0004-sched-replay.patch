@@ -1,0 +1,682 @@
+diff --git a/sim/common/phase_config.h b/sim/common/phase_config.h
+index 771236da4..f362838c5 100644
+--- a/sim/common/phase_config.h
++++ b/sim/common/phase_config.h
+@@ -125,6 +125,40 @@ struct PhaseConfig {
+     return true;
+   }
+ 
++  // PhaseShift patch sched-replay: the register value write() would need to reproduce this config
++  // (inverse of write(); 0 outside the block). Used to push a schedule-replay config down the same DCR path.
++  uint32_t read(uint32_t addr) const {
++    switch (addr) {
++    case VX_DCR_PHASE_MODE:          return mode;
++    case VX_DCR_PHASE_FLAGS:         return flags;
++    case VX_DCR_PHASE_L1_WAYMASK:    return l1_waymask;
++    case VX_DCR_PHASE_L2_WAYMASK:    return l2_waymask;
++    case VX_DCR_PHASE_INSERT_POLICY: return insert_policy;
++    case VX_DCR_PHASE_DXA_DEPTH0:
++    case VX_DCR_PHASE_DXA_DEPTH1: {
++      uint32_t c0 = (addr - VX_DCR_PHASE_DXA_DEPTH0) * 4, v = 0;
++      for (uint32_t i = 0; i < 4; ++i)
++        v |= uint32_t(dxa_depth[c0 + i]) << (8 * i);
++      return v;
++    }
++    case VX_DCR_PHASE_DRAM_SCHED:    return dram_sched;
++    case VX_DCR_PHASE_DRAM_AGING:    return dram_aging;
++    case VX_DCR_PHASE_KV0_BASE_LO:   return uint32_t(kv[0].base);
++    case VX_DCR_PHASE_KV0_BASE_HI:   return uint32_t(kv[0].base >> 32);
++    case VX_DCR_PHASE_KV0_LIMIT_LO:  return uint32_t(kv[0].limit);
++    case VX_DCR_PHASE_KV0_LIMIT_HI:  return uint32_t(kv[0].limit >> 32);
++    case VX_DCR_PHASE_KV1_BASE_LO:   return uint32_t(kv[1].base);
++    case VX_DCR_PHASE_KV1_BASE_HI:   return uint32_t(kv[1].base >> 32);
++    case VX_DCR_PHASE_KV1_LIMIT_LO:  return uint32_t(kv[1].limit);
++    case VX_DCR_PHASE_KV1_LIMIT_HI:  return uint32_t(kv[1].limit >> 32);
++    case VX_DCR_PHASE_WGT_BASE_LO:   return uint32_t(wgt.base);
++    case VX_DCR_PHASE_WGT_BASE_HI:   return uint32_t(wgt.base >> 32);
++    case VX_DCR_PHASE_WGT_LIMIT_LO:  return uint32_t(wgt.limit);
++    case VX_DCR_PHASE_WGT_LIMIT_HI:  return uint32_t(wgt.limit >> 32);
++    default: return 0;
++    }
++  }
++
+   // Canonical one-line form. kernels/common/ps_phase.h (host helper) prints the same format from the values it
+   // wrote, and tests/test_ps_phase.py compares the two strings exactly.
+   std::string str() const {
+diff --git a/sim/simx/cluster.cpp b/sim/simx/cluster.cpp
+index ded6f0737..28f966225 100644
+--- a/sim/simx/cluster.cpp
++++ b/sim/simx/cluster.cpp
+@@ -87,6 +87,8 @@ public:
+     });
+     // PhaseShift (patch ps-counters): count the L1/DXA -> L2 link traffic per class (also when the L2 is bypassed)
+     l2cache_->ps_count_link_inputs();
++    // PhaseShift (patch sched-replay): the L2 is the only cache that honours the persist_l2 sensitivity knob
++    l2cache_->ps_set_persist_capable(true);
+ 
+ 
+     // connect l2cache memory interface
+@@ -473,6 +475,10 @@ public:
+     return 0;
+   }
+ 
++  uint64_t ps_l2_invalidate_range(uint64_t addr, uint64_t size) {   // PhaseShift (patch sched-replay)
++    return l2cache_->ps_persist_active() ? l2cache_->ps_invalidate_range(addr, size) : 0;
++  }
++
+   void for_each_phase_consumer(const PhaseVisitor& visit) const {
+     visit(l2cache_->name(), l2cache_->phase_config());
+     for (auto& socket : sockets_)
+@@ -679,6 +685,10 @@ void Cluster::for_each_phase_consumer(const PhaseVisitor& visit) const {
+   impl_->for_each_phase_consumer(visit);
+ }
+ 
++uint64_t Cluster::ps_l2_invalidate_range(uint64_t addr, uint64_t size) {   // PhaseShift (patch sched-replay)
++  return impl_->ps_l2_invalidate_range(addr, size);
++}
++
+ void Cluster::ps_collect(PsClassCollect& out) const {
+   impl_->ps_collect(out);
+ }
+diff --git a/sim/simx/cluster.h b/sim/simx/cluster.h
+index b33551b29..69a84b644 100644
+--- a/sim/simx/cluster.h
++++ b/sim/simx/cluster.h
+@@ -115,6 +115,10 @@ public:
+   // PhaseShift (patch dcr-phase): visit every [dcr_phase] consumer of this cluster (L2, then each socket's).
+   void for_each_phase_consumer(const PhaseVisitor& visit) const;
+ 
++  // PhaseShift (patch sched-replay): in persist mode, drop the L2 lines overlapping [addr, addr + size) (host
++  // writes to device memory); a no-op returning 0 when the L2 is not in persist mode.
++  uint64_t ps_l2_invalidate_range(uint64_t addr, uint64_t size);
++
+   // PhaseShift (patch mem-class): add the L2's and every socket's class counters to `out`.
+   void ps_collect(PsClassCollect& out) const;
+ 
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+index 737d3d8fb..4101ee87d 100644
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -706,6 +706,26 @@ public:
+ 
+   const Cache::PsClassStats &ps_class_stats() const { return mshr_.ps_stats_; }   // PhaseShift (patch mem-class)
+ 
++  // PhaseShift (patch sched-replay, methodology §5.2): the owning Cache, read by on_reset() for the
++  // persist_l2 sensitivity knob (null until Cache::Impl sets it; the constructor's on_reset() is a full reset).
++  void ps_set_owner(const Cache *owner) { ps_owner_ = owner; }
++
++  // PhaseShift (patch sched-replay): drop every line of this bank holding `addr` (any sector), dirty or not. Called
++  // only between launches in persist mode, for host writes to device memory (the flush that follows every launch
++  // has already written back and cleaned every dirty line). Returns the number of lines dropped.
++  uint32_t ps_invalidate_line(uint64_t addr) {
++    auto &set = sets_.at(params_.addr_set_id(addr));
++    uint64_t tag = params_.addr_tag(addr);
++    uint32_t n = 0;
++    for (auto &line : set.lines) {
++      if (line.any_valid() && line.tag == tag) {
++        line.reset();
++        ++n;
++      }
++    }
++    return n;
++  }
++
+   const Cache::PerfStats &perf_stats() const {
+     return perf_stats_;
+   }
+@@ -737,6 +757,11 @@ public:
+ protected:
+   void on_reset() {
+     // perf_stats_ survives: the MPM counters run from device reset.
++    // PhaseShift (patch sched-replay): in persist mode (Cache::ps_persist_active(): an L2 with the [dcr_phase]
++    // persist_l2 bit set) the tag/data/replacement state of every set survives the per-launch reset; everything
++    // else (MSHR, pipeline, flush walk) is reset as usual. The device is idle at a launch reset, so no line is in a
++    // transient state.
++    const bool ps_keep_lines = (ps_owner_ != nullptr) && ps_owner_->ps_persist_active();
+     pending_mshr_size_ = 0;
+     pending_amo_probes_ = 0;
+     pipe_fill_count_ = 0;
+@@ -746,8 +771,10 @@ protected:
+     pending_fill_reqs_ = 0;
+     rand_ctr_ = 0;
+     adm_seq_ctr_ = 0;
+-    for (auto &set : sets_) {
+-      set.reset();
++    if (!ps_keep_lines) {
++      for (auto &set : sets_) {
++        set.reset();
++      }
+     }
+     mshr_.reset();
+     fwd_active_ = false;
+@@ -1810,6 +1837,7 @@ private:
+ 
+   // Flush walk state.
+   bool     flushing_;
++  const Cache *ps_owner_ = nullptr;   // PhaseShift (patch sched-replay), see ps_set_owner()
+   uint32_t flush_set_idx_;
+   uint32_t flush_way_idx_;
+   uint32_t flush_sector_idx_;
+@@ -1893,6 +1921,7 @@ public:
+     for (uint32_t i = 0, n = num_banks; i < n; ++i) {
+       snprintf(sname, 100, "%s-bank%d", simobject->name().c_str(), i);
+       banks_.at(i) = CacheBank::Create(sname, config, params_, i);
++      banks_.at(i)->ps_set_owner(simobject);   // PhaseShift (patch sched-replay)
+ 
+       // bind core ports
+       bank_core_xbar_->ReqOut.at(i).bind(&banks_.at(i)->core_req_in);
+@@ -1908,7 +1937,20 @@ public:
+     if (config_.bypass)
+       return;
+     // calculate cache initialization cycles
+-    init_cycles_ = params_.sets_per_bank;
++    // PhaseShift (patch sched-replay): persist mode skips the invalidation walk these cycles model (the lines are
++    // kept, CacheBank::on_reset()).
++    init_cycles_ = simobject_->ps_persist_active() ? 0 : params_.sets_per_bank;
++  }
++
++  // PhaseShift (patch sched-replay): drop every line overlapping [addr, addr + size) (line granularity).
++  uint64_t ps_invalidate_range(uint64_t addr, uint64_t size) {
++    if (config_.bypass || size == 0)
++      return 0;
++    const uint64_t line = uint64_t(1) << config_.L;
++    uint64_t n = 0;
++    for (uint64_t a = addr & ~(line - 1); a < addr + size; a += line)
++      n += banks_.at(params_.addr_bank_id(a))->ps_invalidate_line(a);
++    return n;
+   }
+ 
+   void tick() {
+@@ -2091,6 +2133,10 @@ void Cache::flush_begin() {
+   impl_->flush_begin();
+ }
+ 
++uint64_t Cache::ps_invalidate_range(uint64_t addr, uint64_t size) {   // PhaseShift (patch sched-replay)
++  return impl_->ps_invalidate_range(addr, size);
++}
++
+ bool Cache::flush_done() const {
+   return impl_->flush_done();
+ }
+diff --git a/sim/simx/mem/cache.h b/sim/simx/mem/cache.h
+index 701338c76..c13da30c8 100644
+--- a/sim/simx/mem/cache.h
++++ b/sim/simx/mem/cache.h
+@@ -136,6 +136,14 @@ public:
+ 	void set_phase_config(const PhaseConfig& cfg) { phase_cfg_ = cfg; }
+ 	const PhaseConfig& phase_config() const { return phase_cfg_; }
+ 
++	// PhaseShift (patch sched-replay, methodology §5.2): persist_l2 sensitivity knob. Only a cache
++	// marked persist-capable (the L2s, Cluster) honours the [dcr_phase] persist_l2 bit: its per-launch reset then
++	// keeps every line (and skips the init walk). Off by default and never set by the reset config.
++	void ps_set_persist_capable(bool v) { ps_persist_capable_ = v; }
++	bool ps_persist_active() const { return ps_persist_capable_ && phase_cfg_.persist_l2(); }
++	// Drop every line overlapping [addr, addr + size) (host writes in persist mode; returns lines dropped).
++	uint64_t ps_invalidate_range(uint64_t addr, uint64_t size);
++
+ protected:
+ 	void on_reset();
+ 	void on_tick();
+@@ -144,6 +152,7 @@ private:
+ 	class Impl;
+ 	Impl* impl_;
+ 	PhaseConfig phase_cfg_;
++	bool ps_persist_capable_ = false;   // PhaseShift (patch sched-replay)
+ 	uint64_t ps_link_rd_[VX_PS_NUM_CLASSES] = {};   // PhaseShift (patch ps-counters), see ps_count_link_inputs()
+ 	uint64_t ps_link_wr_[VX_PS_NUM_CLASSES] = {};
+ 
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index 4d492fcdf..557f4e582 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -213,6 +213,14 @@ ProcessorImpl::ProcessorImpl()
+   // PhaseShift (patch ps-counters): PS_TRACE=<file> [PS_TRACE_UNIT=marks|instrs] [PS_TRACE_EVERY=<n>] writes the
+   // work-unit interval trace (methodology §12.10); the cores list feeds its work counter.
+   ps_trace_.reset(PsTrace::create_from_env());
++  // PhaseShift (patch sched-replay): PS_SCHEDULE=<file> [PS_SCHEDULE_UNIT=marks|instrs] (methodology §5.1)
++  ps_sched_.reset(PsSchedule::create_from_env());
++  // PhaseShift (patch sched-replay): PS_PERSIST_NO_INVAL=1 disables the persist-mode host-write invalidation (negative
++  // control of the stale-data test ONLY; results of such runs are wrong by construction)
++  {
++    const char* e = std::getenv("PS_PERSIST_NO_INVAL");
++    ps_persist_no_inval_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
++  }
+   for (auto& cluster : clusters_) {
+     for (uint32_t i = 0; cluster->get_core(i) != nullptr; ++i)
+       ps_cores_.push_back(cluster->get_core(i));
+@@ -225,6 +233,9 @@ ProcessorImpl::ProcessorImpl()
+ ProcessorImpl::~ProcessorImpl() {
+   this->ps_trace_end_launch();   // PhaseShift (patch ps-counters): a cycle()-driven last launch
+   ps_trace_.reset();
++  if (ps_persist_launches_ != 0)   // PhaseShift (patch sched-replay): persist-mode summary (sensitivity runs only)
++    std::cout << "PSPERSIST launches=" << ps_persist_launches_ << " host_inval_lines=" << ps_host_inval_lines_
++              << (ps_persist_no_inval_ ? " no_inval=1" : "") << std::endl;
+   SimPlatform::instance().finalize();
+ }
+ 
+@@ -344,6 +355,7 @@ int ProcessorImpl::run() {
+   } while (!done);
+ 
+   this->ps_trace_end_launch();   // PhaseShift (patch ps-counters): closes the launch's last interval row
++  this->ps_sched_end_launch();   // PhaseShift (patch sched-replay): host config back in force for the flush
+   if (ps_debug_class_)
+     this->ps_class_report("end");
+   return exitcode;
+@@ -450,6 +462,8 @@ bool ProcessorImpl::cycle() {
+ 
+ void ProcessorImpl::phase_begin_launch() {
+   ++phase_launches_;
++  if (phase_cfg_.persist_l2())
++    ++ps_persist_launches_;   // PhaseShift (patch sched-replay)
+   phase_dump_pending_ = phase_dump_;
+   // PhaseShift (patch ps-counters): start the launch's interval rows (a launch begun through cycle() and never ended
+   // by run() is closed here first)
+@@ -460,6 +474,49 @@ void ProcessorImpl::phase_begin_launch() {
+     this->ps_snapshot(snap, true);
+     ps_trace_->begin_launch(phase_launches_ - 1, snap);
+   }
++  // PhaseShift (patch sched-replay): start the launch's schedule from the host config; work_count-0 lines apply now,
++  // before the first cycle (and before the PS_DUMP_PHASE report, which therefore shows the effective config)
++  if (ps_sched_) {
++    this->ps_sched_end_launch();   // a cycle()-driven launch is never ended by run(): restore the host config first
++    ps_launch_instrs0_ = this->ps_instrs_total();
++    PhaseConfig eff = ps_sched_->begin_launch(phase_launches_ - 1, phase_cfg_);
++    if (ps_sched_->modified())
++      this->phase_push(eff);
++  }
++}
++
++void ProcessorImpl::ps_sched_switch() {
++  const PhaseConfig& eff = ps_sched_->apply_due(this->ps_sched_work(), SimPlatform::instance().cycles());
++  this->phase_push(eff);
++}
++
++void ProcessorImpl::ps_sched_end_launch() {
++  if (!ps_sched_ || !ps_sched_->in_launch())
++    return;
++  ps_sched_->end_launch();
++  if (ps_sched_->modified()) {
++    this->phase_push(phase_cfg_);
++    ps_sched_->clear_modified();
++  }
++}
++
++void ProcessorImpl::phase_push(const PhaseConfig& cfg) {
++  l3cache_->set_phase_config(cfg);
++  memsim_->set_phase_config(cfg);
++  for (uint32_t addr = VX_DCR_PHASE_STATE_BEGIN; addr < VX_DCR_PHASE_STATE_END; ++addr) {
++    for (auto& cluster : clusters_)
++      cluster->dcr_write(addr, cfg.read(addr));
++  }
++}
++
++uint64_t ProcessorImpl::ps_host_write(uint64_t addr, uint64_t size) {
++  if (ps_persist_no_inval_)
++    return 0;
++  uint64_t n = 0;
++  for (auto& cluster : clusters_)
++    n += cluster->ps_l2_invalidate_range(addr, size);
++  ps_host_inval_lines_ += n;
++  return n;
+ }
+ 
+ // ---------------------------------------------------------------------------------------------------------------
+@@ -517,7 +574,11 @@ uint64_t ProcessorImpl::ps_instrs_total() const {
+ }
+ 
+ uint64_t ProcessorImpl::ps_work() const {
+-  if (ps_trace_->unit() == PsTrace::INSTRS)
++  return this->ps_work_in(ps_trace_->unit() == PsTrace::INSTRS);
++}
++
++uint64_t ProcessorImpl::ps_work_in(bool instrs) const {
++  if (instrs)
+     return this->ps_instrs_total() - ps_launch_instrs0_;
+   uint64_t n = 0;
+   for (auto core : ps_cores_)
+@@ -736,6 +797,14 @@ void Processor::set_mem_telemetry_hook(std::function<void(const MemReq&)> hook)
+   impl_->set_mem_telemetry_hook(std::move(hook));
+ }
+ 
++uint64_t Processor::ps_host_write(uint64_t addr, uint64_t size) {   // PhaseShift (patch sched-replay)
++  return impl_->ps_host_write(addr, size);
++}
++
++bool Processor::ps_persist_l2() const {   // PhaseShift (patch sched-replay)
++  return impl_->ps_persist_l2();
++}
++
+ int Processor::dcr_write(uint32_t addr, uint32_t value) {
+   return impl_->dcr_write(addr, value);
+ }
+diff --git a/sim/simx/processor.h b/sim/simx/processor.h
+index 66081ebbd..780c0b5b9 100644
+--- a/sim/simx/processor.h
++++ b/sim/simx/processor.h
+@@ -59,6 +59,12 @@ public:
+ 
+   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
+ 
++  // PhaseShift (patch sched-replay): the runtime calls this for every host write to device memory
++  // while the device is idle. With the [dcr_phase] persist_l2 bit set it drops the overlapping L2 lines (kept
++  // lines must never hold data older than device RAM); otherwise it does nothing. Returns the lines dropped.
++  uint64_t ps_host_write(uint64_t addr, uint64_t size);
++  bool ps_persist_l2() const;   // the host-latched [dcr_phase] persist_l2 bit
++
+ private:
+   ProcessorImpl* impl_;
+ };
+diff --git a/sim/simx/processor_impl.h b/sim/simx/processor_impl.h
+index 167ea57fd..0900e3b0f 100644
+--- a/sim/simx/processor_impl.h
++++ b/sim/simx/processor_impl.h
+@@ -19,6 +19,7 @@
+ #include "cluster.h"
+ #include "kmu.h"
+ #include "ps_counters.h"   // PhaseShift (patch ps-counters)
++#include "ps_schedule.h"   // PhaseShift (patch sched-replay)
+ #include <memory>
+ #include <vector>
+ 
+@@ -114,11 +115,28 @@ private:
+     ++ps_ticks_;
+   }
+   uint64_t ps_work() const;          // per-launch work counter in the trace unit
++  uint64_t ps_work_in(bool instrs) const;   // per-launch work counter: retired instructions (true) or ps_mark total
+   uint64_t ps_instrs_total() const;  // retired instructions since construction, summed over cores
+   void ps_trace_after_tick() {
+     if (ps_trace_ && ps_trace_->due(this->ps_work()))
+       this->ps_trace_cross();
++    // PhaseShift (patch sched-replay): schedule switches are checked after the trace (a row that closes in the
++    // switching cycle still belongs to the old config: its requests were issued under it)
++    if (ps_sched_ && ps_sched_->due(this->ps_sched_work()))
++      this->ps_sched_switch();
+   }
++  // PhaseShift (patch sched-replay, methodology §5.1): PS_SCHEDULE replay.
++  uint64_t ps_sched_work() const { return this->ps_work_in(ps_sched_->unit() == PsSchedule::INSTRS); }
++  void ps_sched_switch();
++  void ps_sched_end_launch();
++  // Push `cfg` to every consumer through the same path as a host DCR write, without changing phase_cfg_.
++  void phase_push(const PhaseConfig& cfg);
++public:
++  // PhaseShift (patch sched-replay): host write to device memory [addr, addr + size) (runtime hook). In persist_l2
++  // mode it drops the overlapping L2 lines; otherwise nothing.
++  uint64_t ps_host_write(uint64_t addr, uint64_t size);
++  bool ps_persist_l2() const { return phase_cfg_.persist_l2(); }
++private:
+   void ps_trace_cross();
+   void ps_trace_end_launch();
+   void ps_trace_flush();
+@@ -156,6 +174,10 @@ private:
+   std::vector<Core*>       ps_cores_;      // every core, for the trace's work counter
+   uint64_t                 ps_ticks_ = 0;  // simulated cycles since construction (launches and flushes)
+   uint64_t                 ps_launch_instrs0_ = 0;   // ps_instrs_total() at the start of the current launch
++  std::unique_ptr<PsSchedule> ps_sched_;   // PhaseShift (patch sched-replay): PS_SCHEDULE (null = off)
++  uint64_t                 ps_persist_launches_ = 0;   // launches begun with persist_l2 set
++  uint64_t                 ps_host_inval_lines_ = 0;
++  bool                     ps_persist_no_inval_ = false;   // PS_PERSIST_NO_INVAL (negative control only)   // PhaseShift (patch sched-replay): persist-mode host-write drops
+ };
+ 
+ }
+diff --git a/sim/simx/ps_schedule.h b/sim/simx/ps_schedule.h
+new file mode 100644
+index 000000000..b2e158d1e
+--- /dev/null
++++ b/sim/simx/ps_schedule.h
+@@ -0,0 +1,238 @@
++// PhaseShift patch sched-replay (format and rules: docs/methodology.md §5.1).
++//
++// Work-unit schedule replay: PS_SCHEDULE=<file> makes SimX switch the latched [dcr_phase] PhaseConfig inside a launch
++// whenever the per-launch work counter (the trace unit: ps_mark total or retired instructions since the launch
++// began, summed over cores) reaches the work_count of a schedule line. This makes a DP-oracle sub-kernel schedule
++// executable.
++//
++// File format (one switch per line; '#' starts a comment; blank lines ignored):
++//     [launch=<k>] <work_count> <knob>=<value> [<knob>=<value> ...]
++//   launch=<k>   optional: the line applies only to launch k (0-based launch index since device open); a line
++//                without it applies to every launch
++//   work_count   decimal; 0 = at the start of the launch (before its first cycle)
++//   value        decimal or 0x-hex (strtoull base 0)
++// Lines must be in non-decreasing work_count order (checked). Knobs (PhaseConfig fields; policy-only knobs and the
++// classification ranges): mode, insert, dxa_depth0..dxa_depth7, dram_sched, dram_aging, kv0_base, kv0_limit,
++// kv1_base, kv1_limit, wgt_base, wgt_limit, range_acct_only (0/1). Rejected (the parser aborts): l1_waymask and
++// l2_waymask (mechanism A2: a way-mask change needs a flush), lmem / kmu_lmem (A1: needs a kernel boundary),
++// persist_l2 and flags (launch-boundary knob, sensitivity study only), any unknown knob.
++//
++// Semantics: at the start of every launch the effective config is the host-written (DCR-latched) config; then the
++// launch's lines are applied in file order, each one on top of the previous effective config (a line changes only
++// the knobs it names). A line with work_count W > 0 takes effect after the first simulated cycle at which work >= W
++// (several lines crossed in one cycle are applied in order, in that cycle). At the end of a launch (before its
++// trailing flush) the host config is pushed back, so host DCR writes between launches see a clean latch.
++// The unit is PS_SCHEDULE_UNIT=marks|instrs (default: PS_TRACE_UNIT if set, else marks). Every switch prints one line
++// "PSSCHED launch=<k> line=<n> work_count=<W> work=<w> cycle=<c> <PhaseConfig::str()>" (stdout; observation only).
++#pragma once
++
++#include "phase_config.h"
++#include <cerrno>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace vortex {
++
++class PsSchedule {
++public:
++  enum Unit { MARKS = 0, INSTRS = 1 };
++
++  struct Set {
++    enum Knob { MODE, INSERT, DXA_DEPTH, DRAM_SCHED, DRAM_AGING, KV_BASE, KV_LIMIT, WGT_BASE, WGT_LIMIT, RANGE_ACCT };
++    Knob     knob;
++    uint32_t idx;     // dxa_depth class / kv range index
++    uint64_t value;
++  };
++  struct Line {
++    uint32_t         lineno = 0;
++    bool             any_launch = true;
++    uint64_t         launch = 0;
++    uint64_t         work = 0;
++    std::vector<Set> sets;
++  };
++
++  // Returns nullptr unless PS_SCHEDULE is set; aborts on any format error.
++  static PsSchedule* create_from_env() {
++    const char* path = std::getenv("PS_SCHEDULE");
++    if (path == nullptr || path[0] == '\0')
++      return nullptr;
++    Unit unit = MARKS;
++    const char* u = std::getenv("PS_SCHEDULE_UNIT");
++    if (u == nullptr || u[0] == '\0')
++      u = std::getenv("PS_TRACE_UNIT");
++    if (u != nullptr && u[0] != '\0') {
++      if (std::strcmp(u, "marks") == 0) unit = MARKS;
++      else if (std::strcmp(u, "instrs") == 0) unit = INSTRS;
++      else fail(path, 0, std::string("PS_SCHEDULE_UNIT must be marks or instrs (got '") + u + "')");
++    }
++    auto* s = new PsSchedule(unit);
++    s->parse(path);
++    return s;
++  }
++
++  Unit unit() const { return unit_; }
++  size_t size() const { return lines_.size(); }
++
++  // Start of launch `launch`: select its lines; returns the effective config after the work_count-0 lines.
++  PhaseConfig begin_launch(uint64_t launch, const PhaseConfig& host) {
++    launch_ = launch;
++    active_.clear();
++    for (size_t i = 0; i < lines_.size(); ++i)
++      if (lines_[i].any_launch || lines_[i].launch == launch)
++        active_.push_back(i);
++    next_ = 0;
++    eff_ = host;
++    in_launch_ = true;
++    this->apply_due(0, 0);
++    return eff_;
++  }
++  bool in_launch() const { return in_launch_; }
++  void end_launch() { in_launch_ = false; }
++  bool modified() const { return modified_; }
++  void clear_modified() { modified_ = false; }
++
++  // Per-cycle check (cheap).
++  bool due(uint64_t work) const { return in_launch_ && next_ < active_.size() && work >= lines_[active_[next_]].work; }
++
++  // Apply every line with work_count <= work; returns the new effective config.
++  const PhaseConfig& apply_due(uint64_t work, uint64_t cycle) {
++    while (next_ < active_.size() && work >= lines_[active_[next_]].work) {
++      const Line& l = lines_[active_[next_]];
++      for (const auto& st : l.sets)
++        set(eff_, st);
++      modified_ = true;
++      std::cout << "PSSCHED launch=" << launch_ << " line=" << l.lineno << " work_count=" << l.work << " work=" << work
++                << " cycle=" << cycle << " " << eff_.str() << std::endl;
++      ++next_;
++    }
++    return eff_;
++  }
++
++private:
++  explicit PsSchedule(Unit unit) : unit_(unit) {}
++
++  [[noreturn]] static void fail(const char* path, uint32_t lineno, const std::string& msg) {
++    std::cerr << "Error: PS_SCHEDULE " << path << ":" << lineno << ": " << msg << std::endl;
++    std::abort();
++  }
++
++  static bool to_u64(const std::string& t, uint64_t* v) {
++    if (t.empty() || t[0] == '-' || t[0] == '+')
++      return false;
++    errno = 0;
++    char* end = nullptr;
++    unsigned long long x = std::strtoull(t.c_str(), &end, 0);
++    if (errno != 0 || end == nullptr || *end != '\0')
++      return false;
++    *v = x;
++    return true;
++  }
++
++  static void set(PhaseConfig& c, const Set& s) {
++    switch (s.knob) {
++    case Set::MODE:       c.mode = uint32_t(s.value); break;
++    case Set::INSERT:     c.insert_policy = uint32_t(s.value); break;
++    case Set::DXA_DEPTH:  c.dxa_depth[s.idx] = uint8_t(s.value); break;
++    case Set::DRAM_SCHED: c.dram_sched = uint32_t(s.value); break;
++    case Set::DRAM_AGING: c.dram_aging = uint32_t(s.value); break;
++    case Set::KV_BASE:    c.kv[s.idx].base = s.value; break;
++    case Set::KV_LIMIT:   c.kv[s.idx].limit = s.value; break;
++    case Set::WGT_BASE:   c.wgt.base = s.value; break;
++    case Set::WGT_LIMIT:  c.wgt.limit = s.value; break;
++    case Set::RANGE_ACCT:
++      c.flags = s.value ? (c.flags | VX_PHASE_FLAG_RANGE_ACCT_ONLY) : (c.flags & ~uint32_t(VX_PHASE_FLAG_RANGE_ACCT_ONLY));
++      break;
++    }
++  }
++
++  void parse(const char* path) {
++    std::ifstream in(path);
++    if (!in)
++      fail(path, 0, "cannot open");
++    std::string text;
++    uint32_t lineno = 0;
++    uint64_t last_work = 0;
++    while (std::getline(in, text)) {
++      ++lineno;
++      auto hash = text.find('#');
++      if (hash != std::string::npos)
++        text.resize(hash);
++      std::istringstream ss(text);
++      std::vector<std::string> tok;
++      for (std::string t; ss >> t;)
++        tok.push_back(t);
++      if (tok.empty())
++        continue;
++      Line l;
++      l.lineno = lineno;
++      size_t i = 0;
++      if (tok[0].rfind("launch=", 0) == 0) {
++        if (!to_u64(tok[0].substr(7), &l.launch))
++          fail(path, lineno, "bad launch selector '" + tok[0] + "'");
++        l.any_launch = false;
++        ++i;
++      }
++      if (i >= tok.size() || !to_u64(tok[i], &l.work))
++        fail(path, lineno, "expected a work_count (non-negative integer)");
++      ++i;
++      if (l.work < last_work)
++        fail(path, lineno, "work_count decreases (lines must be in non-decreasing work_count order)");
++      last_work = l.work;
++      if (i >= tok.size())
++        fail(path, lineno, "a line needs at least one knob=value");
++      for (; i < tok.size(); ++i) {
++        auto eq = tok[i].find('=');
++        if (eq == std::string::npos || eq == 0)
++          fail(path, lineno, "expected knob=value, got '" + tok[i] + "'");
++        std::string k = tok[i].substr(0, eq);
++        Set s{Set::MODE, 0, 0};
++        if (!to_u64(tok[i].substr(eq + 1), &s.value))
++          fail(path, lineno, "bad value in '" + tok[i] + "'");
++        uint64_t max = 0xffffffffull;
++        if (k == "l1_waymask" || k == "l2_waymask")
++          fail(path, lineno, "'" + k + "' rejected: a way-mask change (A2) needs a flush, not a schedule switch");
++        else if (k == "lmem" || k == "kmu_lmem")
++          fail(path, lineno, "'" + k + "' rejected: an LMEM change (A1) needs a kernel boundary");
++        else if (k == "persist_l2" || k == "flags")
++          fail(path, lineno, "'" + k + "' rejected: persist_l2 is a launch-boundary sensitivity knob, never scheduled");
++        else if (k == "mode") s.knob = Set::MODE;
++        else if (k == "insert") s.knob = Set::INSERT;
++        else if (k.rfind("dxa_depth", 0) == 0 && k.size() == 10 && k[9] >= '0' && k[9] <= '7') {
++          s.knob = Set::DXA_DEPTH; s.idx = uint32_t(k[9] - '0'); max = 0xff;
++        }
++        else if (k == "dram_sched") s.knob = Set::DRAM_SCHED;
++        else if (k == "dram_aging") s.knob = Set::DRAM_AGING;
++        else if (k == "kv0_base" || k == "kv1_base") { s.knob = Set::KV_BASE; s.idx = uint32_t(k[2] - '0'); max = ~0ull; }
++        else if (k == "kv0_limit" || k == "kv1_limit") { s.knob = Set::KV_LIMIT; s.idx = uint32_t(k[2] - '0'); max = ~0ull; }
++        else if (k == "wgt_base") { s.knob = Set::WGT_BASE; max = ~0ull; }
++        else if (k == "wgt_limit") { s.knob = Set::WGT_LIMIT; max = ~0ull; }
++        else if (k == "range_acct_only") { s.knob = Set::RANGE_ACCT; max = 1; }
++        else
++          fail(path, lineno, "unknown knob '" + k + "'");
++        if (s.value > max)
++          fail(path, lineno, "value out of range in '" + tok[i] + "'");
++        l.sets.push_back(s);
++      }
++      lines_.push_back(l);
++    }
++    if (lines_.empty())
++      fail(path, lineno, "no schedule lines");
++  }
++
++  Unit                 unit_;
++  std::vector<Line>    lines_;
++  std::vector<size_t>  active_;
++  size_t               next_ = 0;
++  uint64_t             launch_ = 0;
++  bool                 in_launch_ = false;
++  bool                 modified_ = false;
++  PhaseConfig          eff_;
++};
++
++} // namespace vortex
+diff --git a/sw/runtime/simx/vortex.cpp b/sw/runtime/simx/vortex.cpp
+index 3d3088850..fc200ddf6 100644
+--- a/sw/runtime/simx/vortex.cpp
++++ b/sw/runtime/simx/vortex.cpp
+@@ -158,6 +158,13 @@ private:
+         return;
+       }
+       ram_.write(static_cast<const uint8_t*>(src), addr, bytes);
++      // PhaseShift (patch sched-replay): in persist_l2 mode the L2 keeps its lines across launches, so
++      // a host write must drop the overlapping L2 lines (no-op unless the persist_l2 bit is set; the wait mirrors
++      // vortex_dcr_read: host writes are retired between launches, so it normally returns at once).
++      if (processor_.ps_persist_l2()) {
++        if (future_.valid()) future_.wait();
++        processor_.ps_host_write(addr, bytes);
++      }
+     };
+     h.vortex_dcr_write = [this](uint32_t addr, uint32_t value) {
+       processor_.dcr_write(addr, value);

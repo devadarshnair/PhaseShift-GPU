@@ -1,0 +1,80 @@
+PhaseShift: 3-stage pipelined dot4 datapath (VX_dot4_lane_p, guarded by -DPS_DOT4_PIPE together with -DPS_DOT4_ENABLE in VX_alu_int) plus a flat synth top VX_dot4p_lane_top. Cost model only: no valid/tag sideband delay. Applied after 0001-0003 to vortex-trees/psrtl only.
+
+diff --git a/hw/rtl/core/VX_alu_int.sv b/hw/rtl/core/VX_alu_int.sv
+index 6cd925b..f5b5aae 100644
+--- a/hw/rtl/core/VX_alu_int.sv
++++ b/hw/rtl/core/VX_alu_int.sv
+@@ -140,7 +140,13 @@ module VX_alu_int import VX_gpu_pkg::*; #(
+     wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] dot4_result;
+     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_dot4
+         wire [31:0] dot4_y;
++    `ifdef PS_DOT4_PIPE
++        // follow-up: 3-stage registered datapath (SimX kDot4Latency = 3). Cost model only, see VX_dot4_lane_p.sv.
++        VX_dot4_lane_p dot4 (
++            .clk     (clk),
++    `else
+         VX_dot4_lane dot4 (
++    `endif
+             .a       (alu_in1[i][31:0]),
+             .b       (alu_in2[i][31:0]),
+             .acc     (execute_if.data.rs3_data[i][31:0]),
+diff --git a/hw/rtl/core/VX_dot4_lane_p.sv b/hw/rtl/core/VX_dot4_lane_p.sv
+new file mode 100644
+index 0000000..23feb36
+--- /dev/null
++++ b/hw/rtl/core/VX_dot4_lane_p.sv
+@@ -0,0 +1,34 @@
++// PhaseShift: pipelined version of VX_dot4_lane, same arithmetic, three register stages (latency 3 = SimX
++// kDot4Latency default PS_DOT4_LATENCY=3, the MUL-pipe depth; the PS_DOT4_LATENCY=4 variant would add one adder-tree stage).
++//   stage 1: four signed 8x8 products (4 x 16 b) + acc + use_acc registered
++//   stage 2: 4-input adder tree (18 b) + acc registered
++//   stage 3: final 32-bit add with acc, registered result
++// Inputs are NOT registered (they come from the ALU operand registers). No valid/tag sideband is carried: this module is for
++// datapath area/timing only. Integrating it into VX_alu_int would also need a 3-deep delay of the execute control/tag/uuid/wid/PC/rd
++// fields (the usual Vortex pipe-unit result buffering); those bits are NOT included in the alu_dot4p area.
++module VX_dot4_lane_p (
++    input  wire        clk,
++    input  wire [31:0] a,
++    input  wire [31:0] b,
++    input  wire [31:0] acc,
++    input  wire        use_acc,
++    output wire [31:0] y
++);
++    wire signed [15:0] p0 = $signed(a[ 7: 0]) * $signed(b[ 7: 0]);
++    wire signed [15:0] p1 = $signed(a[15: 8]) * $signed(b[15: 8]);
++    wire signed [15:0] p2 = $signed(a[23:16]) * $signed(b[23:16]);
++    wire signed [15:0] p3 = $signed(a[31:24]) * $signed(b[31:24]);
++    reg signed [15:0] p0_r, p1_r, p2_r, p3_r;
++    reg [31:0] acc_r1, acc_r2;
++    reg        use_r1, use_r2;
++    reg signed [17:0] s_r;
++    reg [31:0] y_r;
++    always @(posedge clk) begin
++        p0_r <= p0; p1_r <= p1; p2_r <= p2; p3_r <= p3;
++        acc_r1 <= acc; use_r1 <= use_acc;
++        s_r <= 18'(p0_r) + 18'(p1_r) + 18'(p2_r) + 18'(p3_r);
++        acc_r2 <= acc_r1; use_r2 <= use_r1;
++        y_r <= 32'($signed(s_r)) + (use_r2 ? acc_r2 : 32'd0);
++    end
++    assign y = y_r;
++endmodule
+diff --git a/hw/unittest/dot4_lane/VX_dot4p_lane_top.sv b/hw/unittest/dot4_lane/VX_dot4p_lane_top.sv
+new file mode 100644
+index 0000000..a2b688c
+--- /dev/null
++++ b/hw/unittest/dot4_lane/VX_dot4p_lane_top.sv
+@@ -0,0 +1,14 @@
++// PhaseShift: NUM_LANES x VX_dot4_lane_p (3-stage pipelined), registered I/O like VX_dot4_lane_top. Not part of any simulation.
++module VX_dot4p_lane_top #(parameter NUM_LANES = 32) (
++    input  wire clk,
++    input  wire [NUM_LANES-1:0][31:0] a, b, acc,
++    input  wire use_acc,
++    output reg  [NUM_LANES-1:0][31:0] y
++);
++    reg [NUM_LANES-1:0][31:0] a_r, b_r, acc_r; reg u_r;
++    wire [NUM_LANES-1:0][31:0] y_w;
++    always @(posedge clk) begin a_r <= a; b_r <= b; acc_r <= acc; u_r <= use_acc; y <= y_w; end
++    for (genvar i = 0; i < NUM_LANES; ++i) begin : g
++        VX_dot4_lane_p l (.clk(clk), .a(a_r[i]), .b(b_r[i]), .acc(acc_r[i]), .use_acc(u_r), .y(y_w[i]));
++    end
++endmodule

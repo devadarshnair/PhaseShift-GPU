@@ -1,0 +1,112 @@
+PhaseShift: minimal standalone RTL of the baseline L2 stream prefetcher (queue + expander + issue gate + 1-bit sector tag RAM). NOT integrated into VX_cache_bank; used for synthesis cost only.
+
+diff --git a/hw/rtl/cache/VX_pf_unit.sv b/hw/rtl/cache/VX_pf_unit.sv
+new file mode 100644
+index 000000000..822f1ddc2
+--- /dev/null
++++ b/hw/rtl/cache/VX_pf_unit.sv
+@@ -0,0 +1,104 @@
++// PhaseShift: MINIMAL standalone RTL of the L2 next-N-sector-on-miss prefetcher (baseline), written ONLY to
++// obtain a synthesis cost (cell count + SRAM bits) with the same flow as the rest of the core. It is NOT integrated into
++// VX_cache_bank (no tag-port arbitration, no MSHR pf/late bits, no counters); those glue costs are not included.
++//   * trigger: a demand-miss sector address (trig_valid, trig_addr) -> candidates trig_addr+1 .. trig_addr+DEPTH
++//   * expander: 1 candidate per cycle into the candidate queue (SimX pushes all DEPTH at once; this is a serial equivalent)
++//   * candidate queue: QSIZE x ADDRW bits (VX_fifo_queue -> RAM macro under -DASIC), push is dropped when full (q_drop in SimX)
++//   * issue: pops the head when the egress has room, MSHR occupancy leaves RESERVE entries free and the residency probe says
++//     "not resident / not in flight" (probe_resident is an INPUT: the tag/MSHR probe is the bank's existing CAM)
++//   * pf tag bit: 1 bit per L2 sector (NUM_SECTORS x 1 RAM), set when a prefetch fill installs, read on a demand hit
++`include "VX_define.vh"
++
++module VX_pf_unit #(
++    parameter ADDRW       = 26,
++    parameter DEPTH       = 8,
++    parameter QSIZE       = 256,
++    parameter RESERVE     = 2,
++    parameter MSHR_SIZE   = 16,
++    parameter NUM_SECTORS = 4096,
++    parameter SECW        = `CLOG2(NUM_SECTORS),
++    parameter OCCW        = `CLOG2(MSHR_SIZE+1)
++) (
++    input  wire                      clk,
++    input  wire                      reset,
++    // trigger: demand miss that allocates a fill
++    input  wire                      trig_valid,
++    input  wire [ADDRW-1:0]          trig_addr,
++    // issue side
++    input  wire                      egress_ready,
++    input  wire [OCCW-1:0] mshr_occupancy,
++    input  wire                      probe_resident,   // sector already resident / in flight / in pipe (existing MSHR CAM + tag probe)
++    output wire                      pf_valid,
++    output wire [ADDRW-1:0]          pf_addr,
++    // sector tag bit (is this resident sector a prefetched, not yet used one?)
++    input  wire                      tag_set,          // prefetch fill installed sector tag_idx
++    input  wire                      tag_clr,          // first demand read hit consumed it
++    input  wire [SECW-1:0]           tag_idx,
++    output wire                      tag_q             // value read for tag_idx (1-cycle read)
++);
++    localparam CNTW = `CLOG2(DEPTH+1);
++
++    // expander
++    reg [ADDRW-1:0] exp_base;
++    reg [CNTW-1:0]  exp_cnt;
++    wire exp_busy = (exp_cnt != 0);
++    wire q_full, q_empty;
++    wire exp_push = exp_busy && ~q_full;
++
++    always @(posedge clk) begin
++        if (reset) begin
++            exp_cnt  <= '0;
++            exp_base <= '0;
++        end else begin
++            if (trig_valid && ~exp_busy) begin      // a trigger while the expander is busy is dropped (accounted as q_drop)
++                exp_base <= trig_addr + ADDRW'(1);
++                exp_cnt  <= CNTW'(DEPTH);
++            end else if (exp_push) begin
++                exp_base <= exp_base + ADDRW'(1);
++                exp_cnt  <= exp_cnt - CNTW'(1);
++            end
++        end
++    end
++
++    // candidate queue
++    wire [ADDRW-1:0] q_head;
++    wire pf_ok = ~q_empty && egress_ready && ~probe_resident && ((mshr_occupancy + OCCW'(RESERVE)) < OCCW'(MSHR_SIZE));
++    wire q_pop = ~q_empty && egress_ready && (probe_resident || pf_ok);   // redundant candidates are dropped without issuing
++
++    VX_fifo_queue #(
++        .DATAW (ADDRW),
++        .DEPTH (QSIZE),
++        .LUTRAM (0)
++    ) cand_q (
++        .clk      (clk),
++        .reset    (reset),
++        .push     (exp_push),
++        .pop      (q_pop),
++        .data_in  (exp_base),
++        .data_out (q_head),
++        .empty    (q_empty),
++        `UNUSED_PIN (alm_empty),
++        .full     (q_full),
++        `UNUSED_PIN (alm_full),
++        `UNUSED_PIN (size)
++    );
++    assign pf_valid = pf_ok;
++    assign pf_addr  = q_head;
++
++    // sector tag bit array
++    VX_dp_ram #(
++        .DATAW (1),
++        .SIZE  (NUM_SECTORS),
++        .RDW_MODE ("W")
++    ) tag_ram (
++        .clk   (clk),
++        .reset (reset),
++        .read  (1'b1),
++        .write (tag_set || tag_clr),
++        .wren  (1'b1),
++        .waddr (tag_idx),
++        .wdata (tag_set),
++        .raddr (tag_idx),
++        .rdata (tag_q)
++    );
++endmodule

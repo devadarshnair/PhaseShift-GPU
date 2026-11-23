@@ -1,0 +1,395 @@
+PhaseShift: read-only MSHR entries. PS_MSHR_RO_N (default 0 = stock path) of the bank's MSHR_SIZE slots are read-only: their payload store drops {byteen,data} (RO replay returns byteen=all-ones, data=0). Strict static partition: reads take only RO slots, writes/AMOs only full slots and BLOCK at core_req_ready when all full slots are busy (per-class VX_pending_size counters). Also PS_MREQ_EXTRA (default 0): extra mem-req queue slots, a control knob (the queue depth is the pow2 >= MSHR_SIZE for write-back caches). Touches VX_cache_mshr.sv, VX_cache_bank.sv. Applied after 0001-0004 to vortex-trees/psrtl only. Functional (simulation) correctness NOT verified: cost model only.
+
+diff --git a/hw/rtl/cache/VX_cache_mshr.sv b/hw/rtl/cache/VX_cache_mshr.sv
+--- a/hw/rtl/cache/VX_cache_mshr.sv
++++ b/hw/rtl/cache/VX_cache_mshr.sv
+@@ -54,8 +54,19 @@
+     parameter AMO_ENABLE        = 0,          // Per-entry AMO tracking (probe outputs)
+     parameter AMO_PASSTHRU      = 0,          // Non-LLC passthrough: AMO entries never coalesce
+     parameter WORD_SEL_WIDTH    = 1,          // word-in-line select width (order-hazard granularity)
++    // PS patch 0005 (read-only MSHR entries). MSHR_SIZE = total slots. Slots [0, MSHR_SIZE-MSHR_RO_SIZE) are FULL entries
++    // (carry the whole payload incl. write data + byte-enables; allocated by writes/AMOs only). Slots
++    // [MSHR_SIZE-MSHR_RO_SIZE, MSHR_SIZE) are READ-ONLY: their payload store drops the RO_DROP_W bits starting at bit
++    // RO_LSB of the payload (the {byteen, data} fields); a replay from such a slot returns byteen = all ones, data = 0.
++    // MSHR_RO_SIZE = 0 elaborates to the stock single-store MSHR.
++    parameter MSHR_RO_SIZE      = 0,
++    parameter RO_LSB            = 0,
++    parameter RO_DROP_W         = 1,
++    parameter RO_ONES_LSB       = 0,          // lsb (within the payload) of the byteen field to fill with ones for RO replays
++    parameter RO_ONES_W         = 1,
+ 
+-    parameter MSHR_ADDR_WIDTH   = `LOG2UP(MSHR_SIZE)
++    parameter MSHR_ADDR_WIDTH   = `LOG2UP(MSHR_SIZE),
++    parameter MSHR_NF           = MSHR_SIZE - MSHR_RO_SIZE   // number of FULL slots
+ ) (
+     input wire clk,
+     input wire reset,
+@@ -106,6 +117,9 @@
+     input wire [WORD_SEL_WIDTH-1:0]     allocate_word_idx,
+     input wire                          allocate_rw,
+     input wire                          allocate_is_amo, // AMO: never coalesce
++    // PS 0005: class of the allocating request (1 = needs a FULL slot: write/AMO; 0 = read, takes a read-only slot).
++    // Ignored when MSHR_RO_SIZE == 0.
++    input wire                          allocate_full_class,
+     input wire [DATA_WIDTH-1:0]         allocate_data,
+     output wire [MSHR_ADDR_WIDTH-1:0]   allocate_id,
+     output wire                         allocate_pending,
+@@ -155,6 +169,11 @@
+ 
+     reg allocate_rdy, allocate_rdy_n;
+     reg [MSHR_ADDR_WIDTH-1:0] allocate_id_r, allocate_id_n;
++    // PS 0005: read-only-class pre-selected slot (unused when MSHR_RO_SIZE == 0) and the class-resolved id/ready
++    reg allocate_rdy_ro_r;
++    wire allocate_rdy_ro_n, allocate_rdy_sel;
++    reg [MSHR_ADDR_WIDTH-1:0] allocate_id_ro_r;
++    wire [MSHR_ADDR_WIDTH-1:0] allocate_id_ro_n, allocate_id_sel;
+ 
+     reg dequeue_val, dequeue_val_n;
+     reg [MSHR_ADDR_WIDTH-1:0] dequeue_id_r, dequeue_id_n;
+@@ -197,14 +216,51 @@
+     end
+     wire [MSHR_SIZE-1:0] free_set = (~valid_table | dequeue_free_oh | finalize_free_oh) & ~allocate_set_oh;
+ 
+-    VX_priority_encoder #(
+-        .N (MSHR_SIZE)
+-    ) allocate_sel (
+-        .data_in   (free_set),
+-        .index_out (allocate_id_n),
+-        .valid_out (allocate_rdy_n),
+-        `UNUSED_PIN (onehot_out)
+-    );
++    if (MSHR_RO_SIZE == 0) begin : g_alloc_stock
++        VX_priority_encoder #(
++            .N (MSHR_SIZE)
++        ) allocate_sel (
++            .data_in   (free_set),
++            .index_out (allocate_id_n),
++            .valid_out (allocate_rdy_n),
++            `UNUSED_PIN (onehot_out)
++        );
++        assign allocate_id_sel = allocate_id_r;
++        assign allocate_rdy_sel = allocate_rdy;
++        `UNUSED_VAR (allocate_full_class)
++        `UNUSED_VAR (allocate_id_ro_r)
++        `UNUSED_VAR (allocate_rdy_ro_r)
++        assign allocate_id_ro_n = '0;
++        assign allocate_rdy_ro_n = 1'b0;
++    end else begin : g_alloc_split
++        // two pre-selected free slots, one per class, both registered like the stock id; the class of the request that
++        // allocates (known at S0) picks between them. The class (full slots [0,NF) / RO slots [NF,N)) is a static partition.
++        wire [`LOG2UP(MSHR_NF)-1:0]      id_f_n;
++        wire [`LOG2UP(MSHR_RO_SIZE)-1:0] id_r_n;
++        wire rdy_f_n, rdy_r_n;
++        VX_priority_encoder #(
++            .N (MSHR_NF)
++        ) allocate_sel_f (
++            .data_in   (free_set[0 +: MSHR_NF]),
++            .index_out (id_f_n),
++            .valid_out (rdy_f_n),
++            `UNUSED_PIN (onehot_out)
++        );
++        VX_priority_encoder #(
++            .N (MSHR_RO_SIZE)
++        ) allocate_sel_r (
++            .data_in   (free_set[MSHR_NF +: MSHR_RO_SIZE]),
++            .index_out (id_r_n),
++            .valid_out (rdy_r_n),
++            `UNUSED_PIN (onehot_out)
++        );
++        assign allocate_id_n      = MSHR_ADDR_WIDTH'(id_f_n);
++        assign allocate_rdy_n     = rdy_f_n;
++        assign allocate_id_ro_n   = MSHR_ADDR_WIDTH'(id_r_n) + MSHR_ADDR_WIDTH'(MSHR_NF);
++        assign allocate_rdy_ro_n  = rdy_r_n;
++        assign allocate_id_sel    = allocate_full_class ? allocate_id_r  : allocate_id_ro_r;
++        assign allocate_rdy_sel   = allocate_full_class ? allocate_rdy   : allocate_rdy_ro_r;
++    end
+ 
+     // find matching tail-entry
+     VX_priority_encoder #(
+@@ -260,10 +316,12 @@
+         if (reset) begin
+             valid_table  <= '0;
+             allocate_rdy <= 0;
++            allocate_rdy_ro_r <= 0;
+             dequeue_val  <= 0;
+         end else begin
+             valid_table  <= valid_table_n;
+             allocate_rdy <= allocate_rdy_n;
++            allocate_rdy_ro_r <= allocate_rdy_ro_n;
+             dequeue_val  <= dequeue_val_n;
+         end
+ 
+@@ -280,11 +338,12 @@
+ 
+         dequeue_id_r  <= dequeue_id_n;
+         allocate_id_r <= allocate_id_n;
++        allocate_id_ro_r <= allocate_id_ro_n;
+         next_table    <= next_table_n;
+     end
+ 
+-    `RUNTIME_ASSERT(~(allocate_fire && valid_table[allocate_id_r]), ("*** %s inuse allocation: addr=0x%0h, id=%0d (#%0d)", INSTANCE_ID,
+-        `CS_BANK_TO_FULL_ADDR(allocate_addr, BANK_ID), allocate_id_r, alc_req_uuid))
++    `RUNTIME_ASSERT(~(allocate_fire && valid_table[allocate_id_sel]), ("*** %s inuse allocation: addr=0x%0h, id=%0d (#%0d)", INSTANCE_ID,
++        `CS_BANK_TO_FULL_ADDR(allocate_addr, BANK_ID), allocate_id_sel, alc_req_uuid))
+ 
+     `RUNTIME_ASSERT(~(finalize_valid && ~valid_table[finalize_id]), ("*** %s invalid release: addr=0x%0h, id=%0d (#%0d)", INSTANCE_ID,
+         `CS_BANK_TO_FULL_ADDR(addr_table[finalize_id], BANK_ID), finalize_id, fin_req_uuid))
+@@ -321,22 +380,78 @@
+         allocate_id, `CS_BANK_TO_FULL_ADDR(allocate_addr, BANK_ID)))
+ `endif
+ 
+-    VX_dp_ram #(
+-        .DATAW (DATA_WIDTH),
+-        .SIZE  (MSHR_SIZE),
+-        .OUT_REG (1),
+-        .RDW_MODE ("W")
+-    ) mshr_store (
+-        .clk   (clk),
+-        .reset (reset),
+-        .read  (1'b1),
+-        .write (allocate_valid),
+-        .wren  (1'b1),
+-        .waddr (allocate_id_r),
+-        .wdata (allocate_data),
+-        .raddr (dequeue_id_n),
+-        .rdata (dequeue_data)
+-    );
++    if (MSHR_RO_SIZE == 0) begin : g_store_stock
++        VX_dp_ram #(
++            .DATAW (DATA_WIDTH),
++            .SIZE  (MSHR_SIZE),
++            .OUT_REG (1),
++            .RDW_MODE ("W")
++        ) mshr_store (
++            .clk   (clk),
++            .reset (reset),
++            .read  (1'b1),
++            .write (allocate_valid),
++            .wren  (1'b1),
++            .waddr (allocate_id_r),
++            .wdata (allocate_data),
++            .raddr (dequeue_id_n),
++            .rdata (dequeue_data)
++        );
++    end else begin : g_store_split
++        localparam NF = MSHR_NF;
++        localparam NR = MSHR_RO_SIZE;
++        localparam RO_DATAW = DATA_WIDTH - RO_DROP_W;
++        // full slots [0,NF): complete payload
++        wire [DATA_WIDTH-1:0] rdata_f;
++        VX_dp_ram #(
++            .DATAW (DATA_WIDTH),
++            .SIZE  (NF),
++            .OUT_REG (1),
++            .RDW_MODE ("W")
++        ) mshr_store (
++            .clk   (clk),
++            .reset (reset),
++            .read  (1'b1),
++            .write (allocate_valid && allocate_full_class),
++            .wren  (1'b1),
++            .waddr (allocate_id_r[`LOG2UP(NF)-1:0]),
++            .wdata (allocate_data),
++            .raddr (dequeue_id_n[`LOG2UP(NF)-1:0]),
++            .rdata (rdata_f)
++        );
++        // read-only slots [NF,N): payload without {byteen, data}
++        wire [RO_DATAW-1:0] wdata_r = {allocate_data[DATA_WIDTH-1 -: (DATA_WIDTH - RO_LSB - RO_DROP_W)], allocate_data[RO_LSB-1:0]};
++        wire [RO_DATAW-1:0] rdata_r;
++        wire [MSHR_ADDR_WIDTH-1:0] raddr_r_full = dequeue_id_n - MSHR_ADDR_WIDTH'(NF);
++        wire [MSHR_ADDR_WIDTH-1:0] waddr_r_full = allocate_id_ro_r - MSHR_ADDR_WIDTH'(NF);
++        VX_dp_ram #(
++            .DATAW (RO_DATAW),
++            .SIZE  (NR),
++            .OUT_REG (1),
++            .RDW_MODE ("W")
++        ) mshr_store_ro (
++            .clk   (clk),
++            .reset (reset),
++            .read  (1'b1),
++            .write (allocate_valid && ~allocate_full_class),
++            .wren  (1'b1),
++            .waddr (waddr_r_full[`LOG2UP(NR)-1:0]),
++            .wdata (wdata_r),
++            .raddr (raddr_r_full[`LOG2UP(NR)-1:0]),
++            .rdata (rdata_r)
++        );
++        `UNUSED_VAR (raddr_r_full)
++        `UNUSED_VAR (waddr_r_full)
++        // output class: the slot the dequeue pointer registers this cycle (same edge as the RAM output register)
++        wire dq_is_ro = (dequeue_id_r >= MSHR_ADDR_WIDTH'(NF));
++        wire [DATA_WIDTH-1:0] rdata_r_x;
++        localparam HI_W = DATA_WIDTH - RO_LSB - RO_DROP_W;
++        assign rdata_r_x[RO_LSB-1:0] = rdata_r[RO_LSB-1:0];
++        localparam [RO_DROP_W-1:0] DROP_FILL = (RO_DROP_W'({RO_ONES_W{1'b1}}) << (RO_ONES_LSB - RO_LSB));
++        assign rdata_r_x[RO_LSB +: RO_DROP_W] = DROP_FILL;
++        assign rdata_r_x[DATA_WIDTH-1 -: HI_W] = rdata_r[RO_LSB +: HI_W];
++        assign dequeue_data = dq_is_ro ? rdata_r_x : rdata_f;
++    end
+ 
+     assign fill_addr = addr_table[fill_id];
+     assign fill_sector = sector_table[fill_id];
+@@ -419,8 +534,8 @@
+         `UNUSED_VAR ({allocate_is_amo, probe_addr})
+     end
+ 
+-    assign allocate_ready = allocate_rdy;
+-    assign allocate_id = allocate_id_r;
++    assign allocate_ready = allocate_rdy_sel;
++    assign allocate_id = allocate_id_sel;
+     assign allocate_previd = prev_idx;
+ 
+     if (WRITEBACK) begin : g_pending_wb
+diff --git a/hw/rtl/cache/VX_cache_bank.sv b/hw/rtl/cache/VX_cache_bank.sv
+--- a/hw/rtl/cache/VX_cache_bank.sv
++++ b/hw/rtl/cache/VX_cache_bank.sv
+@@ -97,7 +97,10 @@
+     // mem-req queue depth (pow2): max of pipeline floor (2*PIPELINE) and writeback reservation (MSHR), plus MREQ_SIZE extra slots.
+     // A writeback cache emits an eviction request alongside the fill on a dirty miss, so up to MSHR_SIZE writebacks can
+     // enqueue at once (one per outstanding miss); reserving MSHR_SIZE slots keeps the queue from stalling the fill drain that frees them.
+-    localparam MREQ_QUEUE_SIZE = 1 << `CLOG2(`MAX(2 * PIPELINE_STAGES, WRITEBACK ? MSHR_SIZE : 0) + MREQ_SIZE);
++`ifndef PS_MREQ_EXTRA
++`define PS_MREQ_EXTRA 0   // PS 0005 control knob: extra mem-req queue slots, to decouple the queue depth (pow2 >= MSHR_SIZE) from the MSHR depth
++`endif
++    localparam MREQ_QUEUE_SIZE = 1 << `CLOG2(`MAX(2 * PIPELINE_STAGES, WRITEBACK ? MSHR_SIZE : 0) + MREQ_SIZE + `PS_MREQ_EXTRA);
+     // core-rsp queue depth (pow2): registered-skid minimum (2) plus CRSQ_SIZE extra slots
+     localparam CRSQ_QUEUE_SIZE = 1 << `CLOG2(2 + CRSQ_SIZE);
+     `STATIC_ASSERT(LATENCY >= 2, ("invalid parameter: cache bank LATENCY must be >= 2"))
+@@ -158,6 +161,14 @@
+     // Shared signals
+     // ------------------------------------------------------------------------
+     wire crsp_queue_stall, mshr_alm_full;
++    // PS patch 0005: read-only MSHR slots. PS_MSHR_RO_N (default 0 = stock) of the MSHR_SIZE slots are read-only (no write
++    // data / byte-enable payload); writes/AMOs are confined to the remaining (full) slots and BLOCK at the core-request
++    // input when all of those are busy; reads are confined to the read-only slots (strict static partition).
++`ifndef PS_MSHR_RO_N
++`define PS_MSHR_RO_N 0
++`endif
++    localparam MSHR_RO_SIZE = `PS_MSHR_RO_N;
++    localparam MSHR_NF_SIZE = MSHR_SIZE - MSHR_RO_SIZE;
+     wire mshr_allocate_st0, fill_inflight;
+     (* max_fanout = 64 *) wire pipe_stall;
+     // Authoritative "no entry held", straight off the MSHR's valid mask. The
+@@ -375,7 +386,11 @@
+     assign replay_ready   = replay_grant && ~fwd_head && ~replay_link_hold && ~(!WRITEBACK && replay_rw && mreq_queue_alm_full) && ~pipe_stall;
+     assign mem_rsp_ready  = fill_grant && ~fwd_pending && ~fill_inflight && ~replay_link_hold && ~amo_wbq_full && ~(WRITEBACK && mreq_queue_alm_full) && ~pipe_stall;
+     assign flush_ready    = flush_grant && ~(WRITEBACK && mreq_queue_alm_full) && ~pipe_stall;
+-    assign core_req_ready = creq_grant && ~mreq_queue_alm_full && ~mshr_alm_full && ~pipe_stall
++    // PS 0005: class-aware MSHR-full (a write/AMO needs a full slot, a read a read-only slot)
++    wire mshr_alm_full_w, mshr_alm_full_r;
++    wire req_is_wr_cls = amo_wb_pending || core_req_rw;
++    wire mshr_full_req = (MSHR_RO_SIZE != 0) ? (req_is_wr_cls ? mshr_alm_full_w : mshr_alm_full_r) : mshr_alm_full;
++    assign core_req_ready = creq_grant && ~mreq_queue_alm_full && ~mshr_full_req && ~pipe_stall
+                          && ~amo_commit_busy && ~req_input_defer;
+ 
+     wire init_fire    = init_valid;
+@@ -384,9 +399,9 @@
+     wire flush_fire   = flush_valid && flush_ready;
+     // amo_wb_path already excludes the cycle a fresh AMO commits at S1, so the
+     // writeback never races the chain update.
+-    wire amo_wb_fire   = amo_wb_path && creq_grant && ~mreq_queue_alm_full && ~mshr_alm_full && ~pipe_stall;
++    wire amo_wb_fire   = amo_wb_path && creq_grant && ~mreq_queue_alm_full && ~mshr_full_req && ~pipe_stall;
+     wire core_req_fire = (amo_creq_path || amo_wb_path) && creq_grant
+-                       && ~mreq_queue_alm_full && ~mshr_alm_full && ~pipe_stall;
++                       && ~mreq_queue_alm_full && ~mshr_full_req && ~pipe_stall;
+ 
+     wire [MSHR_ADDR_WIDTH-1:0] mem_rsp_id = mem_rsp_tag[MSHR_ADDR_WIDTH-1:0];
+ 
+@@ -817,20 +832,63 @@
+     wire [1:0] mshr_dequeue;
+     `POP_COUNT(mshr_dequeue, {(replay_fire || fwd_fire), mshr_release_fire});
+ 
+-    VX_pending_size #(
+-        .SIZE  (MSHR_SIZE),
+-        .DECRW (2)
+-    ) mshr_pending_size (
+-        .clk   (clk),
+-        .reset (reset),
+-        .incr  (core_req_fire),
+-        .decr  (mshr_dequeue),
+-        `UNUSED_PIN (empty),
+-        `UNUSED_PIN (alm_empty),
+-        .full  (mshr_alm_full),
+-        `UNUSED_PIN (alm_full),
+-        `UNUSED_PIN (size)
+-    );
++    if (MSHR_RO_SIZE == 0) begin : g_pend_stock
++        VX_pending_size #(
++            .SIZE  (MSHR_SIZE),
++            .DECRW (2)
++        ) mshr_pending_size (
++            .clk   (clk),
++            .reset (reset),
++            .incr  (core_req_fire),
++            .decr  (mshr_dequeue),
++            `UNUSED_PIN (empty),
++            `UNUSED_PIN (alm_empty),
++            .full  (mshr_alm_full),
++            `UNUSED_PIN (alm_full),
++            `UNUSED_PIN (size)
++        );
++        assign mshr_alm_full_w = mshr_alm_full;
++        assign mshr_alm_full_r = mshr_alm_full;
++    end else begin : g_pend_split
++        // per-class occupancy: incremented at acceptance by the request's class, decremented at release/replay by the class
++        // of the slot being freed (slot id < NF = full slot).
++        wire dq_evt  = (replay_fire || fwd_fire);
++        wire dq_full = (replay_id < MSHR_ADDR_WIDTH'(MSHR_NF_SIZE));
++        wire rl_full = (st1.req.mshr_id < MSHR_ADDR_WIDTH'(MSHR_NF_SIZE));
++        wire [1:0] dec_w, dec_r;
++        `POP_COUNT(dec_w, {(dq_evt && dq_full), (mshr_release_fire && rl_full)});
++        `POP_COUNT(dec_r, {(dq_evt && ~dq_full), (mshr_release_fire && ~rl_full)});
++        VX_pending_size #(
++            .SIZE  (MSHR_NF_SIZE),
++            .DECRW (2)
++        ) mshr_pending_size_w (
++            .clk   (clk),
++            .reset (reset),
++            .incr  (core_req_fire && req_is_wr_cls),
++            .decr  (dec_w),
++            `UNUSED_PIN (empty),
++            `UNUSED_PIN (alm_empty),
++            .full  (mshr_alm_full_w),
++            `UNUSED_PIN (alm_full),
++            `UNUSED_PIN (size)
++        );
++        VX_pending_size #(
++            .SIZE  (MSHR_RO_SIZE),
++            .DECRW (2)
++        ) mshr_pending_size_r (
++            .clk   (clk),
++            .reset (reset),
++            .incr  (core_req_fire && ~req_is_wr_cls),
++            .decr  (dec_r),
++            `UNUSED_PIN (empty),
++            `UNUSED_PIN (alm_empty),
++            .full  (mshr_alm_full_r),
++            `UNUSED_PIN (alm_full),
++            `UNUSED_PIN (size)
++        );
++        assign mshr_alm_full = mshr_alm_full_w | mshr_alm_full_r;
++        `UNUSED_VAR (mshr_dequeue)
++    end
+ 
+     VX_cache_mshr #(
+         .INSTANCE_ID (`SFORMATF(("%s-mshr", INSTANCE_ID))),
+@@ -843,6 +901,11 @@
+         .AMO_ENABLE  (AMO_ENABLE != 0),
+         .AMO_PASSTHRU ((AMO_ENABLE != 0) && (IS_LLC == 0)),
+         .WORD_SEL_WIDTH (WORD_SEL_WIDTH),
++        .MSHR_RO_SIZE (MSHR_RO_SIZE),
++        .RO_LSB      (TAG_WIDTH + REQ_SEL_WIDTH + AMO_REQ_BITS),
++        .RO_DROP_W   (WORD_SIZE + `CS_WORD_WIDTH),
++        .RO_ONES_LSB (TAG_WIDTH + REQ_SEL_WIDTH + AMO_REQ_BITS + `CS_WORD_WIDTH),
++        .RO_ONES_W   (WORD_SIZE),
+         .DATA_WIDTH  (WORD_SEL_WIDTH + WORD_SIZE + `CS_WORD_WIDTH + TAG_WIDTH + REQ_SEL_WIDTH + AMO_REQ_BITS)
+     ) cache_mshr (
+         .clk                 (clk),
+@@ -875,6 +938,7 @@
+         // Only non-LLC AMOs must not coalesce; at the LLC same-line AMOs coalesce
+         // and serialize their commits on the single filled line.
+         .allocate_is_amo     (AMO_ENABLE ? st0.req.amo.amo_valid : 1'b0),
++        .allocate_full_class (st0.req.rw || (AMO_ENABLE ? st0.req.amo.amo_valid : 1'b0)),
+         .allocate_data       ({st0.req.word_idx, st0.req.byteen, write_word_st0, st0.req.tag, st0.req.req_idx, st0.req.amo}),
+         .allocate_id         (mshr_alloc_id),
+         .allocate_pending    (mshr_pending_raw),

@@ -1,0 +1,15 @@
+# third_party/LOCK — every third-party clone/submodule used by PhaseShift.
+# Columns (whitespace-separated): name path url sha date licence
+#   path is relative to phaseshift/; sha is the checked-out commit; date = date the clone was made (fetched);
+#   licence = SPDX id (or a note) read from the licence file in the clone.
+# The vortex-trees/{base,ps} working trees are local clones of these exact SHAs (scripts/mk_vortex_tree.sh).
+vortex third_party/vortex https://github.com/vortexgpgpu/vortex.git 50cb174546ec69a3869b42b8871e932e4440511f 2026-10-30 Apache-2.0
+softfloat third_party/vortex/third_party/softfloat https://github.com/ucb-bar/berkeley-softfloat-3.git b51ef8f3201669b2288104c28546fc72532a1ea4 2026-10-30 BSD-3-Clause
+ramulator third_party/vortex/third_party/ramulator https://github.com/CMU-SAFARI/ramulator2.git e62c84a6f0e06566ba6e182d308434b4532068a5 2026-10-30 MIT
+cvfpu third_party/vortex/third_party/cvfpu https://github.com/openhwgroup/cvfpu.git 79e453139072df42c9ec8f697132ba485d74e23d 2026-10-30 SHL-0.51(+Apache-2.0-vendor/opene906)
+common_cells third_party/vortex/third_party/cvfpu/src/common_cells https://github.com/pulp-platform/common_cells.git 6aeee85d0a34fedc06c14f04fd6363c9f7b4eeea 2026-10-30 SHL-0.51
+fpu_div_sqrt_mvp third_party/vortex/third_party/cvfpu/src/fpu_div_sqrt_mvp https://github.com/pulp-platform/fpu_div_sqrt_mvp.git 86e1f558b3c95e91577c41b2fc452c86b04e85ac 2026-10-30 SHL-0.51
+flexfloat third_party/vortex/third_party/cvfpu/tb/flexfloat https://github.com/oprecomp/flexfloat.git 28be2d4fbf41b38fc37763bb6e90a1c88f6aaa61 2026-10-30 Apache-2.0
+hardfloat third_party/vortex/third_party/hardfloat https://github.com/bsg-external/HardFloat.git aaf5736dffa521603b681fd5853760c671446c85 2026-10-30 BSD-3-Clause
+cocogfx third_party/vortex/third_party/cocogfx https://github.com/gtcasl/cocogfx.git b1befdb36df8af7ac9e2c96acaf81957aab5d107 2026-10-30 unspecified(no-licence-file-in-clone)
+llama2.c third_party/llama2.c https://github.com/karpathy/llama2.c 350e04fe35433e6d2941dce5a1f53308f87058eb 2026-10-31 MIT

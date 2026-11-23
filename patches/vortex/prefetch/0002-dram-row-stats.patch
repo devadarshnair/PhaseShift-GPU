@@ -1,0 +1,93 @@
+PhaseShift: DRAM row-buffer statistics, observation only (no timing change). PsDramB gets row hit/miss/conflict counters (read and write) and request counters, incremented next to Ramulator's own row_hits_N stats in PsTwoClass (ps_dram_ctrl.cpp); the DramSim::Impl destructor prints one PSDRAMROW line per channel at simulator exit (dram_sim.cpp). Needs ps patches 0007/0008 (ps_dram_b.h, ps_dram_ctrl.cpp). Applied via mk_vortex_tree.sh --extra prefetch (tree psall2).
+
+diff --git a/sim/common/dram_sim.cpp b/sim/common/dram_sim.cpp
+--- a/sim/common/dram_sim.cpp
++++ b/sim/common/dram_sim.cpp
+@@ -400,6 +400,21 @@
+   }
+ 
+   ~Impl() {
++    // PhaseShift (patch dram-row-stats): one PSDRAMROW line per channel at simulator exit (cumulative over the whole
++    // run). row_* = row-buffer outcome of each request at its first command (hit: the row is open; conflict: another row is
++    // open; miss: the bank is closed); req_* = requests accepted by the controller. Observation only.
++    for (uint32_t ch = 0; ch < channels_.size(); ++ch) {
++      const auto& b = channels_[ch].b;
++      const unsigned long long rh = b.row_rd_hit, rm = b.row_rd_miss, rc = b.row_rd_conf;
++      const unsigned long long wh = b.row_wr_hit, wm = b.row_wr_miss, wc = b.row_wr_conf;
++      const unsigned long long tot = rh + rm + rc + wh + wm + wc;
++      std::printf("PSDRAMROW ch=%u row_hits=%llu row_misses=%llu row_conflicts=%llu read_hits=%llu read_misses=%llu"
++                  " read_conflicts=%llu write_hits=%llu write_misses=%llu write_conflicts=%llu read_reqs=%llu write_reqs=%llu"
++                  " total_scheduled=%llu hit_rate=%.4f\n",
++                  ch, rh + wh, rm + wm, rc + wc, rh, rm, rc, wh, wm, wc, (unsigned long long)b.n_read_req,
++                  (unsigned long long)b.n_write_req, tot, tot ? double(rh + wh) / double(tot) : 0.0);
++    }
++    std::fflush(stdout);
+     std::ofstream nullstream("ramulator.stats.log");
+     auto original_buf = std::cout.rdbuf();
+     std::cout.rdbuf(nullstream.rdbuf());
+diff --git a/sim/common/ps_dram_b.h b/sim/common/ps_dram_b.h
+--- a/sim/common/ps_dram_b.h
++++ b/sim/common/ps_dram_b.h
+@@ -65,6 +65,10 @@
+   uint64_t bliss_unsafe_grants = 0;   // mode 3: ... while a non-blacklisted request waited in the same buffer (must be 0)
+   uint64_t padc_low_ticks = 0;        // mode 4: controller clocks with padc_low = 1
+   uint64_t padc_low_viol = 0;         // mode 4, low: BULK grants while DEMAND waited in the same buffer (must be 0)
++  // ---- patch dram-row-stats counters: row-buffer outcome of every request at its first command, cumulative ----
++  uint64_t row_rd_hit = 0, row_rd_miss = 0, row_rd_conf = 0;   // reads: row open and same row / bank closed / other row open
++  uint64_t row_wr_hit = 0, row_wr_miss = 0, row_wr_conf = 0;   // writes, same classification
++  uint64_t n_read_req = 0, n_write_req = 0;                    // requests accepted by send() (a read forwarded from the write buffer is counted here only)
+ };
+ 
+ }  // namespace vortex
+diff --git a/sim/common/ps_dram_ctrl.cpp b/sim/common/ps_dram_ctrl.cpp
+--- a/sim/common/ps_dram_ctrl.cpp
++++ b/sim/common/ps_dram_ctrl.cpp
+@@ -180,10 +180,12 @@
+       switch (req.type_id) {
+         case Request::Type::Read: {
+           s_num_read_reqs++;
++          m_ps->n_read_req++;
+           break;
+         }
+         case Request::Type::Write: {
+           s_num_write_reqs++;
++          m_ps->n_write_req++;
+           break;
+         }
+         default: {
+@@ -563,16 +565,19 @@
+       {
+         if (is_row_hit(req)) {
+           s_read_row_hits++;
++          m_ps->row_rd_hit++;
+           s_row_hits++;
+           if (src_ok)
+             s_read_row_hits_per_core[req->source_id]++;
+         } else if (is_row_open(req)) {
+           s_read_row_conflicts++;
++          m_ps->row_rd_conf++;
+           s_row_conflicts++;
+           if (src_ok)
+             s_read_row_conflicts_per_core[req->source_id]++;
+         } else {
+           s_read_row_misses++;
++          m_ps->row_rd_miss++;
+           s_row_misses++;
+           if (src_ok)
+             s_read_row_misses_per_core[req->source_id]++;
+@@ -582,12 +587,15 @@
+       {
+         if (is_row_hit(req)) {
+           s_write_row_hits++;
++          m_ps->row_wr_hit++;
+           s_row_hits++;
+         } else if (is_row_open(req)) {
+           s_write_row_conflicts++;
++          m_ps->row_wr_conf++;
+           s_row_conflicts++;
+         } else {
+           s_write_row_misses++;
++          m_ps->row_wr_miss++;
+           s_row_misses++;
+         }
+       }

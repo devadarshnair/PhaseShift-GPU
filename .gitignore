@@ -1,0 +1,36 @@
+# PhaseShift .gitignore (everything PhaseShift-specific lives here; the repository root has its own).
+
+# Upstream clones are not part of this repo; only the LOCK file (name, url, SHA, date, licence) is tracked.
+/third_party/*
+!/third_party/LOCK
+
+# Local Vortex working trees (clones of third_party/vortex made by scripts/mk_vortex_tree.sh) and all build output
+/vortex-trees/
+/build/
+
+# Write-once fetched data (models, traces) is ignored, but data/MANIFEST.tsv (revisions + sha256 of every fetched
+# file) is tracked: it is the provenance record.
+/data/*
+!/data/MANIFEST.tsv
+
+# Llama-family config.json files are licence-restricted; configs/configs.lock is tracked
+/configs/*.json
+
+# Run outputs and per-run experiment batches stay local; only the shared machine/knob/regression configs are tracked
+/results/
+/experiments/*
+!/experiments/.gitkeep
+!/experiments/configs.yaml
+!/experiments/knobs.yaml
+!/experiments/noop_regression.yaml
+
+# Python and build by-products
+.pytest_cache/
+__pycache__/
+*.vxbin
+*.elf
+
+# JVM crash dumps and editor backups
+hs_err_pid*.log
+*.orig
+*.bak

@@ -1,0 +1,88 @@
+PhaseShift: FFLAGS write-after-write revert, SimX scoreboard only.
+Applied ONLY to the third tree vortex-trees/psff (scripts/mk_vortex_tree.sh --patchset ps --name psff, then git apply --index). Never part of the base/ps patchsets.
+RTL (VX_scoreboard.sv / VX_decode.sv) is NOT changed: the analogous RTL change would keep wr_xregs[XREG_0] out of ibf_xregs_mask for FPU ops and add a per-warp in-flight counter.
+
+diff --git a/sim/simx/scoreboard.cpp b/sim/simx/scoreboard.cpp
+--- a/sim/simx/scoreboard.cpp	2026-11-14 22:17:34.599436061 +0000
++++ b/sim/simx/scoreboard.cpp	2026-11-14 22:17:46.681018099 +0000
+@@ -19,7 +19,8 @@
+ Scoreboard::Scoreboard(const SimContext& ctx, const char* name)
+   : SimObject<Scoreboard>(ctx, name)
+   , in_use_regs_(VX_CFG_NUM_WARPS)
+-  , in_use_fcsr_(VX_CFG_NUM_WARPS, 0) {
++  , in_use_fcsr_(VX_CFG_NUM_WARPS, 0)
++  , fp_inflight_(VX_CFG_NUM_WARPS, 0) {
+   for (auto& in_use_reg : in_use_regs_) {
+     in_use_reg.resize((int)RegType::Count);
+   }
+@@ -36,6 +37,7 @@
+     }
+   }
+   std::fill(in_use_fcsr_.begin(), in_use_fcsr_.end(), 0);
++  std::fill(fp_inflight_.begin(), fp_inflight_.end(), 0);
+   owners_.clear();
+   commit_counts_.clear();
+   pending_releases_.clear();
+@@ -60,8 +62,12 @@
+ 
+ bool Scoreboard::in_use(instr_trace_t* trace) const {
+   auto& instr = *trace->instr_ptr;
+-  if (in_use_fcsr_.at(trace->wid) & (instr.fcsr_reads() | instr.fcsr_writes())) {
+-    return true;
++  uint8_t fcsr_use = instr.fcsr_reads() | instr.fcsr_writes();
++  if (in_use_fcsr_.at(trace->wid) & fcsr_use) {
++    return true;     // a CSR write to FFLAGS/FRM is still in flight (FP ops never set these bits any more)
++  }
++  if (fcsr_use != 0 && !is_fp_flag_op(instr) && fp_inflight_.at(trace->wid) != 0) {
++    return true;     // csrr/csrw of fflags/frm/fcsr: drain the warp's in-flight FP ops first
+   }
+   if (trace->wb) {
+     assert(trace->dst_reg.type != RegType::None);
+@@ -121,12 +127,21 @@
+ }
+ 
+ void Scoreboard::reserve_fcsr(instr_trace_t* trace) {
++  if (is_fp_flag_op(*trace->instr_ptr)) {
++    ++fp_inflight_.at(trace->wid);
++    return;
++  }
+   uint8_t fields = trace->instr_ptr->fcsr_writes();
+   assert((in_use_fcsr_.at(trace->wid) & fields) == 0);
+   in_use_fcsr_.at(trace->wid) |= fields;
+ }
+ 
+ void Scoreboard::release_fcsr(instr_trace_t* trace) {
++  if (is_fp_flag_op(*trace->instr_ptr)) {
++    assert(fp_inflight_.at(trace->wid) != 0);
++    --fp_inflight_.at(trace->wid);
++    return;
++  }
+   uint8_t fields = trace->instr_ptr->fcsr_writes();
+   assert((in_use_fcsr_.at(trace->wid) & fields) == fields);
+   pending_releases_.push_back({trace->wid, {RegType::None, 0}, fields,
+diff --git a/sim/simx/scoreboard.h b/sim/simx/scoreboard.h
+--- a/sim/simx/scoreboard.h	2026-11-14 22:17:34.599476540 +0000
++++ b/sim/simx/scoreboard.h	2026-11-14 22:17:46.680952070 +0000
+@@ -60,6 +60,14 @@
+   void reserve_fcsr(instr_trace_t* trace);
+   void release_fcsr(instr_trace_t* trace);
+ 
++  // FFLAGS revert (/.md #1(b)): FPU arithmetic ops no longer claim FFLAGS as a
++  // write-after-write scoreboard resource. They only count themselves in fp_inflight_[wid]; an instruction that
++  // reads or writes FFLAGS/FRM through the CSR file (csrr/csrw fflags|frm|fcsr) waits until the counter is 0.
++  // FFLAGS is a sticky OR, so the order in which FP ops accumulate flags is architecturally irrelevant.
++  static bool is_fp_flag_op(const Instr& instr) {
++    return instr.get_fu_type() == FUType::FPU && instr.fcsr_writes() != 0;
++  }
++
+ protected:
+   void on_reset();
+   void on_tick();
+@@ -80,6 +88,7 @@
+ 
+   std::vector<std::vector<RegMask>> in_use_regs_;
+   std::vector<uint8_t> in_use_fcsr_;
++  std::vector<uint32_t> fp_inflight_;   // per warp: FPU ops that would write FFLAGS and have not yet committed
+   std::deque<pending_release_t> pending_releases_;
+   std::unordered_map<uint32_t, instr_trace_t*> owners_;
+   std::unordered_map<uint32_t, uint32_t> commit_counts_;

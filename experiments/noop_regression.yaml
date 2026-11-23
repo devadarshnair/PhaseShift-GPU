@@ -1,0 +1,23 @@
+# No-op regression set REG (script: scripts/noop_regression.sh).
+# Every entry runs on BOTH trees (base and ps) with identical app, args, CONFIGS, perf class and environment, so the
+# two runs have identical launch sequences (launch-history rule, docs/methodology.md §2 consequence 5); the
+# PhaseShift DCRs are left at their reset values (the apps never write them). Pass = identical `instrs` and `cycles`.
+# `step:` is filled in by the script (results go to results/<step>/). Add entries here, never remove them:
+#   * ps_decode_attn built without hints/markers (-DPS_HINTS=0, the default) joined `plan` (DONE).
+# REG runs never pass -DPS_HINTS=1: a hint build writes the ps-only mem_hint/ps_mark CSRs and aborts on the base tree
+# by design (unknown CSR); PS_HINTS=0 device ELFs are byte-identical to the pre-hint ones (results/<run>/elf_sha_*).
+defaults: {tree: [base, ps], perf: 1, timeout: 7200}
+runs:
+  # REG at REG-CFG (--cores=4 --l2cache, PLRU L1/L2, --perf=1)
+  - {app: sgemm, args: "-n64", config: REG-CFG, tags: {reg: plan}}
+  - {app: sgemv, args: "-m256 -n256", config: REG-CFG, tags: {reg: plan}}
+  - {app: softmax, args: "-n64", config: REG-CFG, tags: {reg: plan}}
+  # sgemm_tcu_wg_dxa at its own CI config (smoke case 6; WGMMA needs NT=32, NW=8)
+  - {app: sgemm_tcu_wg_dxa, args: "-m 128 -n 128 -k 64", config: smoke-wgmma-dxa, tags: {reg: plan}}
+  # Extension: a 5-launch app that writes nothing (-c none) and one that writes the all-zero [dcr_phase] block
+  # before every launch (-c default; ignored by the base tree's SimX, latched by the ps tree's).
+  - {app: ps_phase_rw, args: ["-L 5 -c none", "-L 5 -c default -w alt"], config: REG-CFG, tags: {reg: extra}}
+  # REG, added: ps_decode_attn (gqa_shared_kv, PS_HINTS=0 build, no [dcr_phase] write) at REG-CFG
+  - {app: ps_decode_attn_gqa, args: "-B 2 -H 8 -K 4 -D 32 -T 128 -v gqa", config: REG-CFG, tags: {reg: plan}}
+  # Extension: the fused mixed-batch kernel (PS_HINTS=0 build) at REG-CFG
+  - {app: ps_mixed_attn, args: "-H 8 -K 4 -D 32 -c 16 -o 16 -T 64 -n 2", config: REG-CFG, tags: {reg: extra}}

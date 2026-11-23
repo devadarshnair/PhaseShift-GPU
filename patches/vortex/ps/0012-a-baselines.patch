@@ -1,0 +1,430 @@
+diff --git a/sim/common/phase_config.h b/sim/common/phase_config.h
+index 3b8eeb583..197cdd67b 100644
+--- a/sim/common/phase_config.h
++++ b/sim/common/phase_config.h
+@@ -15,7 +15,8 @@
+ //   mode          global PhaseShift mode / phase id (0 = off)
+ //   flags         bit 0 VX_PHASE_FLAG_PERSIST_L2 (sensitivity knob; never set by default); bit 1
+ //                 VX_PHASE_FLAG_RANGE_ACCT_ONLY (patch mem-class: ranges for accounting only); bit 2 + bits 31:16
+-//                 FDP-lite DXA policy + its epoch (patch fdp-lite, FLAG_DXA_FDP below); other bits reserved
++//                 FDP-lite DXA policy + its epoch (patch fdp-lite, FLAG_DXA_FDP below); bits 15:3 UCP-lite L2
++//                 partitioning baseline (patch a-baselines, FLAG_L2_UCP below); other bits reserved
+ //   l1_waymask    L1 dcache allowed-victim way masks (0 = all ways, stock; encoding: patch waymask, below)
+ //   l2_waymask    L2 allowed-victim way masks (0 = all ways, stock; encoding: patch waymask, below)
+ //   insert_policy L2 insertion policy for mechanism D and its baselines (0 = stock; encoding below, patch kv-insert)
+@@ -153,6 +154,22 @@ struct PhaseConfig {
+   bool dxa_fdp() const { return (flags & FLAG_DXA_FDP) != 0; }
+   uint32_t dxa_fdp_epoch() const { const uint32_t e = flags >> FDP_E_SHIFT; return e ? e : FDP_E_DEFAULT; }
+ 
++  // PhaseShift (patch a-baselines, docs/methodology.md §14.A.b): UCP-lite, a phase-ignorant
++  // utility-based L2 way partitioning baseline [C40] between two "applications" = request-class groups: A = fills /
++  // accesses whose class is ucp_class() (bits 15:12; 0 = WEIGHT), B = every other class. Fields (all in flags):
++  //   bit 3       FLAG_L2_UCP: on (0 = off = stock; every consumer then behaves exactly as patch waymask)
++  //   bits 11:4   repartition epoch N in units of 1024 L2 cycles (0 = UCP_E_DEFAULT_K = 16 -> 16,384 cycles)
++  //   bits 15:12  class of application A (0 = WEIGHT; 1..7 = that VX_PS_CLASS_*)
++  // Exclusive with a non-zero l2_waymask, a non-zero insert policy and persist_l2 (ProcessorImpl::ps_waymask_check).
++  // UCP-lite reads no mode / phase / schedule input: only the request class (address range or hint), the L2's own
++  // hit/miss stream and the cycle count.
++  static constexpr uint32_t FLAG_L2_UCP     = 0x8;
++  static constexpr uint32_t UCP_FIELD_MASK  = 0xfff8;   // bits 15:3
++  static constexpr uint32_t UCP_E_DEFAULT_K = 16;
++  bool l2_ucp() const { return (flags & FLAG_L2_UCP) != 0; }
++  uint32_t ucp_epoch() const { const uint32_t k = (flags >> 4) & 0xff; return 1024u * (k ? k : UCP_E_DEFAULT_K); }
++  uint32_t ucp_class() const { const uint32_t c = (flags >> 12) & 0xf; return c ? c : uint32_t(VX_PS_CLASS_WEIGHT); }
++
+   // Accounting regions: 0 = kv[0], 1 = kv[1], 2 = wgt, 3 = none of them (same precedence as the classification).
+   static constexpr uint32_t NUM_REGIONS = 4;
+   uint32_t region_of(uint64_t addr) const {
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+index bfad93e32..a83a45a9a 100644
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -173,6 +173,9 @@ struct line_t {
+   uint8_t ps_rrpv = 2;
+   bool ps_fresh = false;
+   bool ps_outcome = false;
++  // PhaseShift (patch a-baselines): request class of the fill that installed the line (the UCP-lite
++  // owner; written on every new-line install, read only when UCP-lite is on).
++  uint8_t ps_fill_cls = 0;
+ 
+   bool any_valid() const {
+     for (const auto &s : sectors) if (s.valid) return true;
+@@ -189,6 +192,7 @@ struct line_t {
+     ps_rrpv = 2;
+     ps_fresh = false;
+     ps_outcome = false;
++    ps_fill_cls = 0;
+     for (auto &s : sectors) s.reset();
+   }
+ };
+@@ -825,6 +829,161 @@ struct PsShct {
+   }
+ };
+ 
++// PhaseShift (patch a-baselines, docs/methodology.md §14.A.b): UCP-lite [C40], one per cache that is
++// UCP-capable (the L2s), shared by its banks. Two applications: app 0 = A = request class PhaseConfig::ucp_class(),
++// app 1 = B = every other class.
++//  * UMON-DSS: an auxiliary tag directory (ATD) per application on UCP_SAMPLES sampled sets, chosen with the paper's
++//    static rule (set 0 and every 33rd set of the cache; global set index g = bank * sets_per_bank + set). Each ATD
++//    set is a true-LRU stack of up to `ways` line tags; a committed core access of app a to a sampled set increments
++//    hits[a][p] if its tag is at stack position p (0 = MRU), then moves / inserts the tag at MRU (dropping the LRU
++//    tag beyond `ways`). The ATD sees each application as if it had the whole cache.
++//  * Repartition at every epoch boundary start + k*N (N = PhaseConfig::ucp_epoch(); start = the cycle of the first
++//    L2 access with UCP on, so the epoch clock is phase-blind): Lookahead algorithm (paper Algorithm 2) on the hit
++//    counters with each application guaranteed one way, then every counter is halved (paper §3.5).
++//  * Evaluation is lazy (at the next L2 access or fill at or after a boundary, before that access is counted), which
++//    is equivalent to evaluating exactly at the boundary: no access happens in between.
++// Printed (observation only, whenever UCP is on): "PSUCP start", one "PSUCP epoch" line per boundary with the
++// pre-halving counters (the test replays the Lookahead from them) and "PSUCP end" at every flush.
++struct PsUcp {
++  static constexpr uint32_t UCP_SAMPLES = 32, UCP_SAMPLE_STEP = 33;
++  uint32_t ways = 0, sets_per_bank = 0, num_banks = 0;
++  bool active = false;
++  uint64_t start = 0, next = 0, epoch = 0;
++  uint32_t len = 0, cls_a = 0;
++  uint32_t alloc[2] = {0, 0};
++  std::vector<uint64_t> hits[2];
++  uint64_t acc[2] = {0, 0};                       // sampled accesses per app in the current epoch (info only)
++  std::vector<std::vector<uint64_t>> atd[2];      // [sample][stack position] = tag, MRU first
++  // counters over the active period (since start), printed at the end
++  uint64_t fills = 0, fills_a = 0, violations = 0, to_other = 0;
++
++  void init(uint32_t w, uint32_t spb, uint32_t nb) { ways = w; sets_per_bank = spb; num_banks = nb; }
++  void reset() { active = false; }
++  int sample_of(uint32_t bank, uint32_t set) const {
++    const uint64_t g = uint64_t(bank) * sets_per_bank + set;
++    if (g % UCP_SAMPLE_STEP != 0) return -1;
++    const uint64_t k = g / UCP_SAMPLE_STEP;
++    return (k < UCP_SAMPLES) ? int(k) : -1;
++  }
++  uint32_t app_of(uint32_t cls) const { return (cls == cls_a) ? 0u : 1u; }
++  void print_alloc(const char* what, uint64_t cycle) const {
++    std::cout << "PSUCP " << what << " cycle=" << cycle << " start=" << start << " len=" << len << " cls_a=" << cls_a
++              << " ways=" << ways << " alloc=" << alloc[0] << ":" << alloc[1] << std::endl;
++  }
++  // Bring the state up to `cycle` under config `cfg` (called before every UMON access and every UCP fill).
++  void sync(const PhaseConfig& cfg, uint64_t cycle) {
++    if (!cfg.l2_ucp()) {
++      if (active) { this->print_end(cycle, 0, 0); active = false; }
++      return;
++    }
++    if (active && (cfg.ucp_epoch() != len || cfg.ucp_class() != cls_a)) {   // re-parameterised: restart
++      this->print_end(cycle, 0, 0);
++      active = false;
++    }
++    if (!active) {
++      active = true;
++      start = cycle; len = cfg.ucp_epoch(); cls_a = cfg.ucp_class(); next = start + len; epoch = 0;
++      alloc[0] = ways / 2; alloc[1] = ways - ways / 2;   // initial partition: even split (our choice)
++      for (int a = 0; a < 2; ++a) {
++        hits[a].assign(ways, 0);
++        acc[a] = 0;
++        atd[a].assign(UCP_SAMPLES, std::vector<uint64_t>());
++      }
++      fills = fills_a = violations = to_other = 0;
++      this->print_alloc("start", cycle);
++    }
++    while (cycle >= next) {
++      this->repartition(next);
++      next += len;
++    }
++  }
++  void observe(uint32_t bank, uint32_t set, uint64_t tag, uint32_t cls) {
++    const int k = this->sample_of(bank, set);
++    if (k < 0) return;
++    const uint32_t a = this->app_of(cls);
++    auto& st = atd[a][k];
++    ++acc[a];
++    auto it = std::find(st.begin(), st.end(), tag);
++    if (it != st.end()) {
++      ++hits[a][uint32_t(it - st.begin())];
++      st.erase(it);
++    } else if (st.size() >= ways) {
++      st.pop_back();
++    }
++    st.insert(st.begin(), tag);
++  }
++  // U_a(n) - U_a(m): hits app a would gain going from m to n ways (n > m)
++  uint64_t gain(uint32_t a, uint32_t m, uint32_t n) const {
++    uint64_t g = 0;
++    for (uint32_t p = m; p < n && p < ways; ++p) g += hits[a][p];
++    return g;
++  }
++  // Lookahead (paper Algorithm 2) with one way pre-assigned to each application (paper §3.5: at least one way each).
++  // Marginal utility mu = gain / blocks, compared exactly as fractions; for each application the smallest block count
++  // reaching its max mu; the higher max mu wins (tie -> app A, our choice). If neither application has a positive mu
++  // the remaining ways are split evenly, the extra way to A (our choice; the paper leaves blocks_req undefined there).
++  void lookahead(uint32_t out[2]) const {
++    out[0] = 1; out[1] = 1;
++    uint32_t balance = ways - 2;
++    while (balance > 0) {
++      uint64_t bg[2] = {0, 0}; uint32_t bk[2] = {0, 0};
++      for (uint32_t a = 0; a < 2; ++a) {
++        for (uint32_t k = 1; k <= balance; ++k) {
++          const uint64_t g = this->gain(a, out[a], out[a] + k);
++          if (g == 0) continue;
++          if (bk[a] == 0 || g * bk[a] > bg[a] * k) { bg[a] = g; bk[a] = k; }   // strictly larger mu; ties keep the smaller k
++        }
++      }
++      if (bk[0] == 0 && bk[1] == 0) {
++        out[0] += balance - balance / 2;
++        out[1] += balance / 2;
++        break;
++      }
++      uint32_t win;
++      if (bk[1] == 0) win = 0;
++      else if (bk[0] == 0) win = 1;
++      else win = (bg[1] * bk[0] > bg[0] * bk[1]) ? 1 : 0;
++      out[win] += bk[win];
++      balance -= bk[win];
++    }
++  }
++  void repartition(uint64_t boundary) {
++    uint32_t na[2];
++    this->lookahead(na);
++    std::cout << "PSUCP epoch=" << epoch << " cycle=" << boundary << " start=" << start << " len=" << len
++              << " cls_a=" << cls_a << " acc=" << acc[0] << ":" << acc[1] << " hitsA=";
++    for (uint32_t p = 0; p < ways; ++p) std::cout << (p ? "," : "") << hits[0][p];
++    std::cout << " hitsB=";
++    for (uint32_t p = 0; p < ways; ++p) std::cout << (p ? "," : "") << hits[1][p];
++    std::cout << " old=" << alloc[0] << ":" << alloc[1] << " new=" << na[0] << ":" << na[1] << std::endl;
++    alloc[0] = na[0]; alloc[1] = na[1];
++    for (int a = 0; a < 2; ++a) { for (auto& h : hits[a]) h >>= 1; acc[a] = 0; }
++    ++epoch;
++  }
++  // Allowed-victim mask for a new line of class `cls` in a set (paper §3.6 enforcement on top of patch waymask's
++  // masked select_victim): free ways first; else if app a holds fewer lines in the set than its allocation, the
++  // ways held by the other application, else the ways held by a.
++  uint32_t victim_mask(const std::vector<line_t>& lines, uint32_t cls, bool* other) const {
++    const uint32_t a = this->app_of(cls);
++    uint32_t freem = 0, own = 0, oth = 0, n_own = 0;
++    for (uint32_t i = 0; i < lines.size(); ++i) {
++      if (!lines[i].any_valid()) { freem |= 1u << i; continue; }
++      if (this->app_of(lines[i].ps_fill_cls) == a) { own |= 1u << i; ++n_own; }
++      else oth |= 1u << i;
++    }
++    *other = false;
++    if (freem) return freem;
++    if (n_own < alloc[a] && oth) { *other = true; return oth; }
++    return own ? own : oth;
++  }
++  void print_end(uint64_t cycle, uint64_t occ_a, uint64_t valid) const {
++    std::cout << "PSUCP end cycle=" << cycle << " start=" << start << " len=" << len << " cls_a=" << cls_a
++              << " epochs=" << epoch << " alloc=" << alloc[0] << ":" << alloc[1] << " fills=" << fills
++              << " fills_a=" << fills_a << " to_other=" << to_other << " violations=" << violations
++              << " occ_a=" << occ_a << " valid=" << valid << std::endl;
++  }
++};
++
+ class CacheBank : public SimObject<CacheBank> {
+ public:
+   // A memory-side request leaves the bank through a queue with a registered
+@@ -886,6 +1045,28 @@ public:
+ 
+   // PhaseShift (patch d-baselines): the cache-wide SHCT (set by Cache::Impl).
+   void ps_set_shct(PsShct *t) { ps_shct_ = t; }
++  // PhaseShift (patch a-baselines): the cache-wide UCP-lite state (set by Cache::Impl; null = not UCP-capable).
++  void ps_set_ucp(PsUcp *u) { ps_ucp_ = u; }
++  // true (after syncing the epoch clock) if UCP-lite is on for this bank's cache now
++  bool ps_ucp_on() {
++    if (ps_ucp_ == nullptr || ps_owner_ == nullptr || !ps_owner_->ps_ucp_capable())
++      return false;
++    const PhaseConfig &pc = ps_owner_->phase_config();
++    if (!pc.l2_ucp() && !ps_ucp_->active)
++      return false;
++    ps_ucp_->sync(pc, SimPlatform::instance().cycles());
++    return ps_ucp_->active;
++  }
++  void ps_ucp_observe(uint32_t set_id, uint64_t tag, uint32_t cls) {
++    if (this->ps_ucp_on())
++      ps_ucp_->observe(bank_id_, set_id, tag, cls);
++  }
++  // valid lines and lines of class `cls_a` (UCP-lite end-of-launch occupancy, observation only)
++  void ps_ucp_occupancy(uint32_t cls_a, uint64_t *occ_a, uint64_t *valid) const {
++    for (const auto &set : sets_)
++      for (const auto &l : set.lines)
++        if (l.any_valid()) { ++*valid; if (l.ps_fill_cls == cls_a) ++*occ_a; }
++  }
+   // PhaseShift (patch d-baselines): SRRIP / SHiP-Mem-lite selected in the L2 insert word (0 = neither).
+   uint32_t ps_repl() const {
+     return (ps_owner_ != nullptr) ? (ps_owner_->ps_insert() & PhaseConfig::INS_REPL_MASK) : 0u;
+@@ -1336,7 +1517,16 @@ private:
+       } else {
+         // PhaseShift (patch waymask, mechanism A2): restrict the victim to the allowed ways of this fill's mask
+         const uint32_t wm_word = (ps_owner_ != nullptr) ? ps_owner_->ps_waymask() : 0u;
+-        if (wm_word == 0) {
++        if (wm_word == 0 && this->ps_ucp_on()) {
++          // PhaseShift (patch a-baselines): UCP-lite enforcement through the masked victim selection
++          bool other = false;
++          const uint32_t um = ps_ucp_->victim_mask(set.lines, ps_cls, &other);
++          line_id = set.select_victim(config_.repl_policy, rand_ctr_, &free_id, &repl_id, um);
++          ++ps_ucp_->fills;
++          if (ps_ucp_->app_of(ps_cls) == 0) ++ps_ucp_->fills_a;
++          if (other) ++ps_ucp_->to_other;
++          if (((um >> line_id) & 1u) == 0) ++ps_ucp_->violations;   // independent re-check of the selection
++        } else if (wm_word == 0) {
+           line_id = set.select_victim(config_.repl_policy, rand_ctr_, &free_id, &repl_id);
+         } else {
+           const bool wgt = (ps_cls == VX_PS_CLASS_WEIGHT);
+@@ -1406,6 +1596,8 @@ private:
+ 
+     auto &line = set.lines.at(line_id);
+     line.tag     = addr_tag;
++    if (!is_refill)
++      line.ps_fill_cls = uint8_t(ps_cls);   // PhaseShift (patch a-baselines): UCP-lite owner (stored always, read only by UCP)
+     if (ps_ins == 0) {
+       line.lru_ctr = 0;   // stock SimX: a fill inserts at MRU
+     } else {
+@@ -1900,6 +2092,7 @@ private:
+             mshr_.defer_to_replay(id);
+             DT(3, this->name() << " mshr-defer: " << bank_req);
+           }
++          this->ps_ucp_observe(set_id, addr_tag, bank_req.flags.mem_class);   // PhaseShift (patch a-baselines): UMON
+           --pending_mshr_size_;
+           this->pipeLineErase(set_id, addr_tag);
+           pipe_req_->pop();
+@@ -2033,6 +2226,7 @@ private:
+       if (config_.repl_policy == Cache::PLRU)
+         set.update_lru(hit_id);
+       this->ps_repl_hit(set, set_id, hit_id, false);   // PhaseShift (patch d-baselines)
++      this->ps_ucp_observe(set_id, addr_tag, bank_req.flags.mem_class);   // PhaseShift (patch a-baselines): UMON
+       --pending_mshr_size_;
+       this->pipeLineErase(set_id, addr_tag);
+       pipe_req_->pop();
+@@ -2133,6 +2327,7 @@ private:
+   bool     flushing_;
+   const Cache *ps_owner_ = nullptr;   // PhaseShift (patch sched-replay), see ps_set_owner()
+   PsShct *ps_shct_ = nullptr;         // PhaseShift (patch d-baselines), see ps_set_shct()
++  PsUcp *ps_ucp_ = nullptr;           // PhaseShift (patch a-baselines), see ps_set_ucp()
+   uint32_t flush_set_idx_;
+   uint32_t flush_way_idx_;
+   uint32_t flush_sector_idx_;
+@@ -2168,6 +2363,7 @@ public:
+     char sname[100];
+ 
+     uint32_t num_banks = (1 << config.B);
++    ps_ucp_.init(params_.lines_per_set, params_.sets_per_bank, num_banks);   // PhaseShift (patch a-baselines)
+ 
+     if (config_.bypass) {
+       snprintf(sname, 100, "%s-bypass_arb", simobject->name().c_str());
+@@ -2218,6 +2414,7 @@ public:
+       banks_.at(i) = CacheBank::Create(sname, config, params_, i);
+       banks_.at(i)->ps_set_owner(simobject);   // PhaseShift (patch sched-replay)
+       banks_.at(i)->ps_set_shct(&ps_shct_);    // PhaseShift (patch d-baselines)
++      banks_.at(i)->ps_set_ucp(&ps_ucp_);      // PhaseShift (patch a-baselines)
+ 
+       // bind core ports
+       bank_core_xbar_->ReqOut.at(i).bind(&banks_.at(i)->core_req_in);
+@@ -2239,6 +2436,7 @@ public:
+     ps_written_.clear();   // PhaseShift (patch kv-insert)
+     if (!simobject_->ps_persist_active())
+       ps_shct_.reset();    // PhaseShift (patch d-baselines): predictor state is cold per launch like the lines
++    ps_ucp_.reset();       // PhaseShift (patch a-baselines): UMON and partition restart cold every launch
+   }
+ 
+   // PhaseShift (patch sched-replay): drop every line overlapping [addr, addr + size) (line granularity).
+@@ -2366,6 +2564,13 @@ public:
+       ps_shct_.dump(SimPlatform::instance().cycles());
+       ps_shct_.dumped = true;
+     }
++    // PhaseShift (patch a-baselines): end-of-launch UCP-lite summary (observation only), once per launch
++    if (ps_ucp_.active) {
++      uint64_t occ = 0, valid = 0;
++      for (const auto &bank : banks_) bank->ps_ucp_occupancy(ps_ucp_.cls_a, &occ, &valid);
++      ps_ucp_.print_end(SimPlatform::instance().cycles(), occ, valid);
++      ps_ucp_.active = false;
++    }
+     for (auto &bank : banks_) {
+       bank->flush_begin();
+     }
+@@ -2416,6 +2621,7 @@ private:
+   uint32_t init_cycles_;
+   std::unordered_set<uint64_t> ps_written_;   // PhaseShift (patch kv-insert): lines written this launch (D bypass)
+   PsShct ps_shct_;                             // PhaseShift (patch d-baselines): SHiP-Mem-lite SHCT
++  PsUcp ps_ucp_;                               // PhaseShift (patch a-baselines): UCP-lite UMON + partition
+ };
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+diff --git a/sim/simx/mem/cache.h b/sim/simx/mem/cache.h
+index 20eb7b3e2..390762593 100644
+--- a/sim/simx/mem/cache.h
++++ b/sim/simx/mem/cache.h
+@@ -169,6 +169,8 @@ public:
+ 	// cache obeys: 0 none (every cache by default: icaches, L3, ...), 1 l1_waymask (the L1 dcaches, Socket), 2
+ 	// l2_waymask (the L2s, Cluster). ps_waymask() = the word in force (0 = all ways = stock).
+ 	void ps_set_waymask_level(uint8_t lvl) { ps_waymask_level_ = lvl; }
++	// PhaseShift (patch a-baselines, methodology §14.A.b): UCP-lite acts at the L2s only (level 2).
++	bool ps_ucp_capable() const { return ps_waymask_level_ == 2; }
+ 	uint32_t ps_waymask() const {
+ 		return (ps_waymask_level_ == 1) ? phase_cfg_.l1_waymask : (ps_waymask_level_ == 2) ? phase_cfg_.l2_waymask : 0u;
+ 	}
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index 695b2f024..ccaf134fc 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -401,6 +401,17 @@ void ProcessorImpl::ps_waymask_check(const PhaseConfig& cfg, const char* where)
+               << "): " << why << std::endl;
+     std::abort();
+   };
++  // PhaseShift (patch a-baselines): UCP-lite (flags bits 15:3) owns the L2 victim choice
++  if (cfg.l2_ucp()) {
++    if (!VX_CFG_L2_ENABLED) fail("flags(l2_ucp)", cfg.flags, "the L2 is disabled");
++    if (uint32_t(VX_CFG_L2_REPL_POLICY) != uint32_t(Cache::PLRU)) fail("flags(l2_ucp)", cfg.flags, "UCP-lite needs a PLRU L2");
++    if (cfg.l2_waymask != 0) fail("flags(l2_ucp)", cfg.flags, "exclusive with a non-zero l2_waymask");
++    if (cfg.insert_policy != 0) fail("flags(l2_ucp)", cfg.flags, "exclusive with a non-zero L2 insert policy");
++    if (cfg.persist_l2()) fail("flags(l2_ucp)", cfg.flags, "exclusive with persist_l2");
++    if (((cfg.flags >> 12) & 0xf) >= VX_PS_NUM_CLASSES) fail("flags(l2_ucp)", cfg.flags, "class A >= the number of classes");
++  } else if ((cfg.flags & PhaseConfig::UCP_FIELD_MASK) != 0) {
++    fail("flags", cfg.flags, "UCP-lite fields (bits 15:4) set without bit 3");
++  }
+   if (cfg.l1_waymask == 0 && cfg.l2_waymask == 0)
+     return;
+   const char* err = PhaseConfig::waymask_error(cfg.l1_waymask, VX_CFG_DCACHE_NUM_WAYS);
+diff --git a/sim/simx/ps_schedule.h b/sim/simx/ps_schedule.h
+index 27a6006fd..51637c967 100644
+--- a/sim/simx/ps_schedule.h
++++ b/sim/simx/ps_schedule.h
+@@ -15,7 +15,8 @@
+ // classification ranges): mode, insert, dxa_depth0..dxa_depth7, dram_sched, dram_aging, kv0_base, kv0_limit,
+ // kv1_base, kv1_limit, wgt_base, wgt_limit, range_acct_only (0/1). Rejected (the parser aborts): l1_waymask and
+ // l2_waymask (mechanism A2: a way-mask change needs a flush), lmem / kmu_lmem (A1: needs a kernel boundary),
+-// persist_l2 and flags (launch-boundary knob, sensitivity study only), any unknown knob.
++// persist_l2 and flags (launch-boundary knob, sensitivity study only), any unknown knob. Also accepted: dxa_fdp (patch
++// fdp-lite) and l2_ucp (patch a-baselines: UCP-lite on/off, flags bits 15:3).
+ //
+ // Semantics: at the start of every launch the effective config is the host-written (DCR-latched) config; then the
+ // launch's lines are applied in file order, each one on top of the previous effective config (a line changes only
+@@ -44,7 +45,7 @@ public:
+   enum Unit { MARKS = 0, INSTRS = 1 };
+ 
+   struct Set {
+-    enum Knob { MODE, INSERT, DXA_DEPTH, DRAM_SCHED, DRAM_AGING, KV_BASE, KV_LIMIT, WGT_BASE, WGT_LIMIT, RANGE_ACCT, DXA_FDP };
++    enum Knob { MODE, INSERT, DXA_DEPTH, DRAM_SCHED, DRAM_AGING, KV_BASE, KV_LIMIT, WGT_BASE, WGT_LIMIT, RANGE_ACCT, DXA_FDP, L2_UCP };
+     Knob     knob;
+     uint32_t idx;     // dxa_depth class / kv range index
+     uint64_t value;
+@@ -157,6 +158,9 @@ private:
+       c.flags = (c.flags & 0x0000fffbu)
+               | (s.value ? (PhaseConfig::FLAG_DXA_FDP | (uint32_t(s.value) << PhaseConfig::FDP_E_SHIFT)) : 0u);
+       break;
++    case Set::L2_UCP:   // PhaseShift (patch a-baselines): flags bits 15:3 only
++      c.flags = (c.flags & ~PhaseConfig::UCP_FIELD_MASK) | uint32_t(s.value);
++      break;
+     case Set::RANGE_ACCT:
+       c.flags = s.value ? (c.flags | VX_PHASE_FLAG_RANGE_ACCT_ONLY) : (c.flags & ~uint32_t(VX_PHASE_FLAG_RANGE_ACCT_ONLY));
+       break;
+@@ -228,6 +232,14 @@ private:
+         // PhaseShift (patch fdp-lite): dxa_fdp=E turns the FDP-lite DXA policy on with epoch E cycles (1..65535),
+         // dxa_fdp=0 turns it off (flags bit 2 + bits 31:16 only; persist_l2 and the other flag bits are untouched).
+         else if (k == "dxa_fdp") { s.knob = Set::DXA_FDP; max = 0xffff; }
++        // PhaseShift (patch a-baselines): l2_ucp=<flags bits 15:3> turns UCP-lite on (bit 3 set; bits 11:4
++        // epoch / 1024, bits 15:12 class A, PhaseConfig::FLAG_L2_UCP) or off (0). UCP-lite is a policy knob: its
++        // partition is enforced at victim selection only (lookups search every way), so no flush is needed.
++        else if (k == "l2_ucp") {
++          s.knob = Set::L2_UCP; max = 0xfff8;
++          if ((s.value & ~uint64_t(PhaseConfig::UCP_FIELD_MASK)) != 0 || (s.value != 0 && (s.value & PhaseConfig::FLAG_L2_UCP) == 0))
++            fail(path, lineno, "l2_ucp needs bit 3 set and only bits 15:3 (got '" + tok[i] + "')");
++        }
+         else
+           fail(path, lineno, "unknown knob '" + k + "'");
+         if (s.value > max)

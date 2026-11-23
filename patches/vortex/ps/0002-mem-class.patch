@@ -1,0 +1,1156 @@
+diff --git a/VX_types.toml b/VX_types.toml
+index 7d9cd3c92..35e47dca5 100644
+--- a/VX_types.toml
++++ b/VX_types.toml
+@@ -149,6 +149,8 @@ VX_DCR_PHASE_STATE_END      = 0x03D
+ 
+ [phase_const]
+ VX_PHASE_FLAG_PERSIST_L2    = 0x1
++VX_PHASE_FLAG_RANGE_ACCT_ONLY = 0x2  # ps patch mem-class: the KV/weight ranges label DRAM bytes for PS_DEBUG_CLASS
++                                    # accounting only and do NOT classify requests (hint-only classification)
+ 
+ # DXA descriptor DCR mapping
+ # access pattern:
+@@ -611,6 +613,30 @@ VX_CSR_CTA_ENTRY = 0xCE1  # kernel entry PC, supplied per-CTA by the KMU
+ VX_CSR_FRAG_POS     = 0xCE2  # {covered[31], y[30:16], x[15:0]} of this lane's pixel
+ VX_CSR_FRAG_PID     = 0xCE3  # primitive index of this lane's quad
+ 
++# PhaseShift CSRs (ps patch mem-class). User-level read/write CSRs must sit in the RISC-V custom range
++# 0x800-0x8FF (bits[11:10] = 10, bits[9:8] = 00: user, read/write); 0xC00-0xFFF is read-only by convention. No other
++# VX_CSR_* uses 0x8xx. 0x8C0-0x8C7 is reserved for PhaseShift. Both are per warp / per core state of the ps tree only:
++# the base tree aborts on them (unknown CSR), so kernels write them only when built with -DPS_HINTS=1.
++[csr_ps]
++VX_CSR_PS_MEM_HINT = 0x8C0  # per-warp memory request class (VX_PS_CLASS_*) of the warp's loads/stores; 0 = unset
++VX_CSR_PS_MARK     = 0x8C1  # write: count one work unit of type value&7 (VX_PS_MARK_*) on this core; read: core total
++
++# Memory request classes (MemFlags.mem_class, bits 21-23 of the SimX request flags; docs/methodology.md §12)
++[ps_mem_class]
++VX_PS_CLASS_ORDINARY   = 0  # unclassified (reset value)
++VX_PS_CLASS_WEIGHT     = 1  # weights / parameters
++VX_PS_CLASS_KV_PERSIST = 2  # KV-cache data that is re-read within the launch (e.g. a prefill chunk's keys/values)
++VX_PS_CLASS_KV_STREAM  = 3  # KV-cache data read once per step (decode)
++VX_PS_CLASS_BULK_DXA   = 4  # DXA engine bulk GMEM reads (always, set where DXA builds the request)
++VX_PS_NUM_CLASSES      = 8  # 3-bit field; 5-7 reserved
++
++# ps_mark work-unit types (VX_CSR_PS_MARK)
++[ps_mark_type]
++VX_PS_MARK_OTHER        = 0
++VX_PS_MARK_PREFILL_TILE = 1
++VX_PS_MARK_DECODE_TILE  = 2
++VX_PS_NUM_MARK_TYPES    = 8  # 3-bit type field; 3-7 reserved
++
+ [dcr_mpm_class]
+ VX_DCR_MPM_CLASS_BASE    = 0
+ VX_DCR_MPM_CLASS_CORE    = 1
+diff --git a/sim/common/dram_sim.cpp b/sim/common/dram_sim.cpp
+index bc899b89f..404e535ab 100644
+--- a/sim/common/dram_sim.cpp
++++ b/sim/common/dram_sim.cpp
+@@ -398,6 +398,10 @@ bool DramSim::can_accept(uint32_t channel) const {
+   return impl_->can_accept(channel);
+ }
+ 
+-void DramSim::send_request(uint32_t channel, uint64_t addr, bool is_write, ResponseCallback callback, void* arg) {
++void DramSim::send_request(uint32_t channel, uint64_t addr, bool is_write, ResponseCallback callback, void* arg,
++                           uint32_t mem_class) {
++  // PhaseShift (patch mem-class): count the class; the request itself is timed exactly as before.
++  static_assert(kPsClasses == VX_PS_NUM_CLASSES, "DramSim class table must match VX_PS_NUM_CLASSES");
++  ++(is_write ? ps_wr_reqs_ : ps_rd_reqs_)[mem_class & (kPsClasses - 1)];
+   impl_->send_request(channel, addr, is_write, callback, arg);
+ }
+diff --git a/sim/common/dram_sim.h b/sim/common/dram_sim.h
+index 7222be048..434653c08 100644
+--- a/sim/common/dram_sim.h
++++ b/sim/common/dram_sim.h
+@@ -56,16 +56,29 @@ public:
+   bool can_accept(uint32_t channel) const;
+ 
+   // addr: byte address within the channel.
+-  void send_request(uint32_t channel, uint64_t addr, bool is_write, ResponseCallback response_cb, void* arg);
++  // mem_class (PhaseShift patch mem-class): the request class (VX_PS_CLASS_*, docs/methodology.md §12). Defaulted, so
++  // the RTL simulators' five-argument calls (rtlsim/opaesim/xrtsim) compile unchanged and count as ORDINARY. In this
++  // patch the class is only counted (ps_class_reqs); it does not change scheduling or timing.
++  void send_request(uint32_t channel, uint64_t addr, bool is_write, ResponseCallback response_cb, void* arg,
++                    uint32_t mem_class = 0);
++
++  // PhaseShift (patch mem-class): requests accepted per class (reads / writes), cumulative since construction
++  // (reset() leaves them alone, like the MPM counters). One request = one block of block_size bytes.
++  uint64_t ps_class_reqs(uint32_t mem_class, bool is_write) const {
++    return (is_write ? ps_wr_reqs_ : ps_rd_reqs_)[mem_class & (kPsClasses - 1)];
++  }
+ 
+   // PhaseShift (patch dcr-phase): DCR-latched [dcr_phase] config; reset() leaves it alone.
+   void set_phase_config(const PhaseConfig& cfg) { phase_cfg_ = cfg; }
+   const PhaseConfig& phase_config() const { return phase_cfg_; }
+ 
+ private:
++  static constexpr uint32_t kPsClasses = 8;   // = VX_PS_NUM_CLASSES (3-bit class field)
+   class Impl;
+   Impl* impl_;
+   PhaseConfig phase_cfg_;
++  uint64_t ps_rd_reqs_[kPsClasses] = {};
++  uint64_t ps_wr_reqs_[kPsClasses] = {};
+ };
+ 
+ }
+diff --git a/sim/common/phase_config.h b/sim/common/phase_config.h
+index 2896b1094..771236da4 100644
+--- a/sim/common/phase_config.h
++++ b/sim/common/phase_config.h
+@@ -13,7 +13,8 @@
+ //
+ // Field semantics (encoding only; each mechanism patch documents its meaning in docs/methodology.md §14):
+ //   mode          global PhaseShift mode / phase id (0 = off)
+-//   flags         bit 0 VX_PHASE_FLAG_PERSIST_L2 (sensitivity knob; never set by default), other bits reserved
++//   flags         bit 0 VX_PHASE_FLAG_PERSIST_L2 (sensitivity knob; never set by default); bit 1
++//                 VX_PHASE_FLAG_RANGE_ACCT_ONLY (patch mem-class: ranges for accounting only); other bits reserved
+ //   l1_waymask    L1 dcache allowed-way mask (0 = all ways, stock)
+ //   l2_waymask    L2 allowed-way mask (0 = all ways, stock)
+ //   insert_policy L2 insertion policy id for mechanism D (0 = stock)
+@@ -56,6 +57,36 @@ struct PhaseConfig {
+ 
+   bool persist_l2() const { return (flags & VX_PHASE_FLAG_PERSIST_L2) != 0; }
+ 
++  // PhaseShift patch mem-class (rules in docs/methodology.md §12). Address-range classification: a
++  // request whose class is still ORDINARY (no mem_hint) is classified by the first range that contains its address,
++  // in the fixed order kv[0] -> KV_STREAM, kv[1] -> KV_PERSIST, wgt -> WEIGHT (the host programs kv[0] with the KV
++  // rows a step streams once, kv[1] with KV rows that are re-read within the launch). With
++  // VX_PHASE_FLAG_RANGE_ACCT_ONLY the ranges only label DRAM traffic for PS_DEBUG_CLASS accounting (region_of) and
++  // classify nothing, so a hint-only build can be measured against the same ranges. Empty ranges (the reset value)
++  // match nothing, so the reset config classifies nothing.
++  bool range_acct_only() const { return (flags & VX_PHASE_FLAG_RANGE_ACCT_ONLY) != 0; }
++  bool any_range() const { return !kv[0].empty() || !kv[1].empty() || !wgt.empty(); }
++
++  // Accounting regions: 0 = kv[0], 1 = kv[1], 2 = wgt, 3 = none of them (same precedence as the classification).
++  static constexpr uint32_t NUM_REGIONS = 4;
++  uint32_t region_of(uint64_t addr) const {
++    if (kv[0].contains(addr)) return 0;
++    if (kv[1].contains(addr)) return 1;
++    if (wgt.contains(addr))   return 2;
++    return 3;
++  }
++  static uint32_t region_class(uint32_t region) {
++    static const uint32_t cls[NUM_REGIONS] = {VX_PS_CLASS_KV_STREAM, VX_PS_CLASS_KV_PERSIST, VX_PS_CLASS_WEIGHT,
++                                              VX_PS_CLASS_ORDINARY};
++    return cls[region < NUM_REGIONS ? region : NUM_REGIONS - 1];
++  }
++  // The class the ranges give an unhinted request at `addr` (ORDINARY if none applies or accounting-only).
++  uint32_t range_class(uint64_t addr) const {
++    if (this->range_acct_only() || !this->any_range())
++      return VX_PS_CLASS_ORDINARY;
++    return region_class(this->region_of(addr));
++  }
++
+   static bool is_phase_dcr(uint32_t addr) {
+     return addr >= VX_DCR_PHASE_STATE_BEGIN && addr < VX_DCR_PHASE_STATE_END;
+   }
+@@ -117,6 +148,22 @@ private:
+   static void set_hi(uint64_t& f, uint32_t v) { f = (f & uint64_t(0xffffffffu)) | (uint64_t(v) << 32); }
+ };
+ 
++// PhaseShift patch mem-class: request-class helpers shared by SimX and the DRAM model.
++// Priority used by the MSHR merge rule (methodology §12): BULK_DXA (a copy engine's bulk read, no warp waits on it
++// directly) ranks below every demand class; all other classes rank equally in this patch (mechanism patches may
++// refine the table). A chain's priority is the maximum over its requesters.
++inline uint32_t ps_class_prio(uint32_t cls) { return (cls == VX_PS_CLASS_BULK_DXA) ? 0u : 1u; }
++inline const char* ps_class_name(uint32_t cls) {
++  switch (cls) {
++  case VX_PS_CLASS_ORDINARY:   return "ORDINARY";
++  case VX_PS_CLASS_WEIGHT:     return "WEIGHT";
++  case VX_PS_CLASS_KV_PERSIST: return "KV_PERSIST";
++  case VX_PS_CLASS_KV_STREAM:  return "KV_STREAM";
++  case VX_PS_CLASS_BULK_DXA:   return "BULK_DXA";
++  default:                     return "RSVD";
++  }
++}
++
+ // Visitor over the consumers holding a latched copy: (consumer name, its copy). Used by PS_DUMP_PHASE.
+ using PhaseVisitor = std::function<void(const std::string& consumer, const PhaseConfig& cfg)>;
+ 
+diff --git a/sim/simx/cluster.cpp b/sim/simx/cluster.cpp
+index 39ca6bc90..3238a4abd 100644
+--- a/sim/simx/cluster.cpp
++++ b/sim/simx/cluster.cpp
+@@ -477,6 +477,12 @@ public:
+       socket->for_each_phase_consumer(visit);
+   }
+ 
++  void ps_collect(PsClassCollect& out) const {
++    out.l2 += l2cache_->ps_class_stats();
++    for (auto& socket : sockets_)
++      socket->ps_collect(out);
++  }
++
+   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+     for (auto& socket : sockets_) {
+       int ret = socket->dcr_read(addr, tag, value);
+@@ -666,6 +672,10 @@ void Cluster::for_each_phase_consumer(const PhaseVisitor& visit) const {
+   impl_->for_each_phase_consumer(visit);
+ }
+ 
++void Cluster::ps_collect(PsClassCollect& out) const {
++  impl_->ps_collect(out);
++}
++
+ int Cluster::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+   return impl_->dcr_read(addr, tag, value);
+ }
+diff --git a/sim/simx/cluster.h b/sim/simx/cluster.h
+index 5d0e5a830..0c8cdc0bc 100644
+--- a/sim/simx/cluster.h
++++ b/sim/simx/cluster.h
+@@ -38,6 +38,7 @@
+ namespace vortex {
+ 
+ class ProcessorImpl;
++struct PsClassCollect;   // socket.h (PhaseShift patch mem-class)
+ 
+ class Socket;
+ 
+@@ -114,6 +115,9 @@ public:
+   // PhaseShift (patch dcr-phase): visit every [dcr_phase] consumer of this cluster (L2, then each socket's).
+   void for_each_phase_consumer(const PhaseVisitor& visit) const;
+ 
++  // PhaseShift (patch mem-class): add the L2's and every socket's class counters to `out`.
++  void ps_collect(PsClassCollect& out) const;
++
+   class Core* get_core(uint32_t idx) const;
+ 
+   // Cache flush walk. ProcessorImpl ticks in level order (L1 in parallel
+diff --git a/sim/simx/core.cpp b/sim/simx/core.cpp
+index ec729d83e..4609ad635 100644
+--- a/sim/simx/core.cpp
++++ b/sim/simx/core.cpp
+@@ -1166,6 +1166,7 @@ Core::~Core() {
+ }
+ 
+ void Core::on_reset() {
++  ps_marks_.fill(0);   // PhaseShift (patch mem-class): ps_mark counters are per launch
+   impl_->reset();
+ }
+ 
+diff --git a/sim/simx/core.h b/sim/simx/core.h
+index df1e117b7..4af725f5f 100644
+--- a/sim/simx/core.h
++++ b/sim/simx/core.h
+@@ -205,6 +205,16 @@ public:
+ 
+   int get_exitcode() const;
+ 
++  // PhaseShift (patch mem-class): per-core work-unit counters written through VX_CSR_PS_MARK (one count per CSR
++  // write instruction of a warp; type = value & 7, VX_PS_MARK_*). Per launch: cleared by on_reset().
++  void     ps_mark(uint32_t type) { ++ps_marks_.at(type & (VX_PS_NUM_MARK_TYPES - 1)); }
++  uint64_t ps_mark_count(uint32_t type) const { return ps_marks_.at(type & (VX_PS_NUM_MARK_TYPES - 1)); }
++  uint64_t ps_mark_total() const {
++    uint64_t n = 0;
++    for (auto c : ps_marks_) n += c;
++    return n;
++  }
++
+ protected:
+   void on_reset();
+   void on_tick();
+@@ -217,6 +227,7 @@ private:
+ 
+   uint32_t core_id_;
+   Socket*  socket_;
++  std::array<uint64_t, VX_PS_NUM_MARK_TYPES> ps_marks_ = {};   // PhaseShift (patch mem-class)
+ 
+   class Impl;
+   Impl* impl_;
+diff --git a/sim/simx/csr_unit.cpp b/sim/simx/csr_unit.cpp
+index 9291bf8a8..741957081 100644
+--- a/sim/simx/csr_unit.cpp
++++ b/sim/simx/csr_unit.cpp
+@@ -122,6 +122,10 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
+   case VX_CSR_CTA_LMEM_ADDR:   return warp.cta_csrs.lmem_addr;
+   case VX_CSR_CTA_CLUSTER_SIZE: return warp.cta_csrs.cluster_size;
+ 
++  // PhaseShift (patch mem-class): custom user read/write CSRs 0x8C0/0x8C1 (VX_types.toml [csr_ps])
++  case VX_CSR_PS_MEM_HINT: return warp.ps_mem_hint;
++  case VX_CSR_PS_MARK:     return (Word)core_->ps_mark_total();
++
+   CSR_READ_64(VX_CSR_MCYCLE, core_perf.cycles);
+   CSR_READ_64(VX_CSR_MINSTRET, core_perf.instrs);
+   default:
+@@ -350,6 +354,15 @@ void CsrUnit::set_csr(uint32_t addr, Word value, uint32_t wid, uint32_t tid) {
+   case VX_CSR_MSCRATCH:
+     warp.mscratch = value;
+     break;
++  // PhaseShift (patch mem-class). mem_hint: the class (low 3 bits) tagged onto this warp's later loads/stores
++  // (LsuUnit); 0 = unset (address ranges decide, methodology §12). ps_mark: one work unit of type value & 7 on this
++  // core; process() calls this once per CSR instruction (not once per SFU packet), so a warp counts one unit.
++  case VX_CSR_PS_MEM_HINT:
++    warp.ps_mem_hint = uint32_t(value) & (VX_PS_NUM_CLASSES - 1);
++    break;
++  case VX_CSR_PS_MARK:
++    core_->ps_mark(uint32_t(value));
++    break;
+   case VX_CSR_SATP:
+ #ifdef VX_CFG_VM_ENABLE
+     // Readback mirror only. The translation satp is device-programmed through
+@@ -419,6 +432,9 @@ void CsrUnit::process(instr_trace_t* trace) {
+   // The warp is processed one SFU-width packet at a time: a packet's active
+   // lanes read the CSR, then its first active lane supplies the write.
+   constexpr uint32_t kPacketLanes = VX_CFG_NUM_SFU_LANES;
++  // PhaseShift (patch mem-class): a ps_mark write counts one unit per warp instruction, so only the first packet
++  // with an active lane performs the write (every packet still returns the read value).
++  bool ps_mark_written = false;
+   for (uint32_t base = 0; base < num_threads; base += kPacketLanes) {
+     uint32_t first = num_threads;
+     for (uint32_t t = base; t < base + kPacketLanes; ++t) {
+@@ -437,6 +453,16 @@ void CsrUnit::process(instr_trace_t* trace) {
+     }
+     Word csr_value = rd_data[first].i;
+     Word src_v = csrArgs.is_imm ? csrArgs.imm : rs1_data[first].i;
++    if (csr_addr == VX_CSR_PS_MARK) {
++      // the written value is the unit type (src_v), not a read-modify-write of the counter; CSRRS/CSRRC with a
++      // zero source do not write (RISC-V semantics), as below
++      bool writes = (csr_type == CsrType::CSRRW) || (src_v != 0);
++      if (writes && !ps_mark_written) {
++        this->set_csr(csr_addr, src_v, wid, first);
++        ps_mark_written = true;
++      }
++      continue;
++    }
+     switch (csr_type) {
+     case CsrType::CSRRW:
+       this->set_csr(csr_addr, src_v, wid, first);
+diff --git a/sim/simx/dxa/dxa_core.cpp b/sim/simx/dxa/dxa_core.cpp
+index 1af907477..5ebe16c77 100644
+--- a/sim/simx/dxa/dxa_core.cpp
++++ b/sim/simx/dxa/dxa_core.cpp
+@@ -581,9 +581,13 @@ private:
+     mreq.tag   = slot;
+     mreq.hart_id   = w.req.core->id();
+     mreq.uuid  = w.req.uuid;
++    // PhaseShift (patch mem-class): every DXA GMEM read is BULK_DXA, tagged where it is built (errata 13); the LMEM
++    // write below (smem_wr) is left alone. Per-stream classes come with mechanism C.
++    mreq.flags.mem_class = VX_PS_CLASS_BULK_DXA;
+ 
+     auto& ch = gmem_arb_->ReqIn.at(w.worker_id);
+     if (!ch.try_send(mreq)) return; // arb backpressure
++    simobject_->ps_count_gmem(mreq.flags.mem_class);
+ 
+     w.inflight[slot].allocated   = true;
+     w.inflight[slot].rsp_arrived = false;
+diff --git a/sim/simx/dxa/dxa_core.h b/sim/simx/dxa/dxa_core.h
+index f421d8fd1..7fe0184d5 100644
+--- a/sim/simx/dxa/dxa_core.h
++++ b/sim/simx/dxa/dxa_core.h
+@@ -88,6 +88,10 @@ public:
+   void set_phase_config(const PhaseConfig& cfg) { phase_cfg_ = cfg; }
+   const PhaseConfig& phase_config() const { return phase_cfg_; }
+ 
++  // PhaseShift (patch mem-class): GMEM read requests issued, by class (cumulative since construction; PS_DEBUG_CLASS).
++  void ps_count_gmem(uint32_t cls) { ++ps_gmem_reqs_[cls & (VX_PS_NUM_CLASSES - 1)]; }
++  uint64_t ps_gmem_reqs(uint32_t cls) const { return ps_gmem_reqs_[cls & (VX_PS_NUM_CLASSES - 1)]; }
++
+ protected:
+   void on_reset();
+   void on_tick();
+@@ -96,6 +100,7 @@ private:
+   class Impl;
+   Impl* impl_;
+   PhaseConfig phase_cfg_;
++  uint64_t ps_gmem_reqs_[VX_PS_NUM_CLASSES] = {};
+ 
+   friend class SimObject<DxaCore>;
+ };
+diff --git a/sim/simx/lsu_unit.cpp b/sim/simx/lsu_unit.cpp
+index c891fc3f5..2577a6d2e 100644
+--- a/sim/simx/lsu_unit.cpp
++++ b/sim/simx/lsu_unit.cpp
+@@ -20,6 +20,7 @@
+ #include <nan_box.h>
+ #include "debug.h"
+ #include "core.h"
++#include "scheduler.h"   // PhaseShift (patch mem-class): warp_t::ps_mem_hint
+ #include "local_mem_switch.h"
+ #include "constants.h"
+ #include "mem_block_pool.h"
+@@ -504,6 +505,10 @@ void LsuUnit::process_request_step(uint32_t b) {
+ 		if (is_amo) {
+ 			lsu_req.flags.amo_unsigned = amo_is_unsigned(*amo_tag);
+ 		}
++		// PhaseShift (patch mem-class): the issuing warp's mem_hint (VX_CSR_PS_MEM_HINT; 0 = unset) is the class of
++		// every lane of this request; unset requests may still be classified by the [dcr_phase] address ranges at the
++		// first cache they enter (Cache, methodology §12). Warp-uniform, like the other LsuReq flags.
++		lsu_req.flags.mem_class = core_->scheduler().warp(trace->wid).ps_mem_hint;
+ 		uint32_t t0 = state.addr_list.size() - state.remain_addrs;
+ 		uint32_t beat_n = std::min<uint32_t>(VX_CFG_NUM_LSU_LANES, state.remain_addrs);
+ 		std::vector<mem_addr_size_t> lane_entries(VX_CFG_NUM_LSU_LANES);
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+index df1a19d7e..57c19c441 100644
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -142,12 +142,16 @@ struct sector_t {
+   bool dirty;
+   uint64_t dirty_mask;                 // per-byte dirty bits; the writeback byte-enable
+   std::shared_ptr<mem_block_t> data;  // sector bytes (= one mem_block)
++  // PhaseShift (patch mem-class): class of the most recent fill or write of this sector; dirty write-backs carry it
++  // (methodology §12). Instrumentation only: no replacement or timing decision reads it in this patch.
++  uint8_t ps_class = 0;
+ 
+   void reset() {
+     valid = false;
+     dirty = false;
+     dirty_mask = 0;
+     data.reset();
++    ps_class = 0;
+   }
+ };
+ 
+@@ -422,6 +426,9 @@ struct mshr_entry_t {
+   uint32_t line_id;
+   uint64_t seq;         // enqueue order; replays drain oldest-first to preserve
+                         // program order among coalesced same-line accesses.
++  // PhaseShift (patch mem-class): priority of the entry's (set,tag,sector) chain = max over its requesters of
++  // ps_class_prio(class) (methodology §12); kept equal in every entry of the chain. Not read by timing yet.
++  uint8_t ps_chain_prio;
+ 
+   mshr_entry_t() {
+     this->reset();
+@@ -434,6 +441,7 @@ struct mshr_entry_t {
+     sector_id = 0;
+     line_id = 0;
+     seq = 0;
++    ps_chain_prio = 0;
+   }
+ };
+ 
+@@ -520,8 +528,40 @@ public:
+   }
+ 
+   // Enqueue a new core request and return the allocated entry id.
++  // PhaseShift (patch mem-class) merge rule (methodology §12): a request that joins an existing (set,tag,sector)
++  // chain leaves the chain's class alone -- the chain's fill was issued with the class of its FIRST requester and is
++  // already in flight -- and raises the chain priority to the max over all requesters. Counted in ps_stats_.
+   int enqueue(const bank_req_t &bank_req, uint32_t set_id, uint64_t addr_tag, uint32_t sector_id) {
+     assert(bank_req.type == bank_req_t::Core);
++    {
++      const uint32_t cls  = bank_req.flags.mem_class;
++      const uint8_t  prio = (uint8_t)ps_class_prio(cls);
++      bool chained = false;
++      uint8_t chain_prio = 0;
++      const mshr_entry_t* first = nullptr;
++      for (auto &entry : entries_) {
++        if (entry.bank_req.type != bank_req_t::None && entry.set_id == set_id && entry.addr_tag == addr_tag
++         && entry.sector_id == sector_id) {
++          chained = true;
++          chain_prio = std::max(chain_prio, entry.ps_chain_prio);
++          if (first == nullptr || entry.seq < first->seq)
++            first = &entry;
++        }
++      }
++      ps_new_prio_ = prio;
++      if (chained) {
++        if (first->bank_req.flags.mem_class != cls)
++          ++ps_stats_.mixed_merges;
++        if (prio > chain_prio)
++          ++ps_stats_.prio_upgrades;
++        ps_new_prio_ = std::max(prio, chain_prio);
++        for (auto &entry : entries_) {
++          if (entry.bank_req.type != bank_req_t::None && entry.set_id == set_id && entry.addr_tag == addr_tag
++           && entry.sector_id == sector_id)
++            entry.ps_chain_prio = ps_new_prio_;
++        }
++      }
++    }
+     for (uint32_t i = 0, n = entries_.size(); i < n; ++i) {
+       auto &entry = entries_.at(i);
+       if (entry.bank_req.type == bank_req_t::None) {
+@@ -531,6 +571,7 @@ public:
+         entry.sector_id = sector_id;
+         entry.line_id = 0; // victim is selected at Fill time
+         entry.seq = bank_req.adm_seq;
++        entry.ps_chain_prio = ps_new_prio_;
+         ++size_;
+         return i;
+       }
+@@ -614,12 +655,17 @@ public:
+     }
+     ready_reqs_ = 0;
+     size_ = 0;
++    // ps_stats_ survives (cumulative since device construction, like the MPM counters)
+   }
+ 
++  // PhaseShift (patch mem-class): merge-rule counters (mixed_merges, prio_upgrades; reqs[] is filled by the bank).
++  Cache::PsClassStats ps_stats_;
++
+ private:
+   std::vector<mshr_entry_t> entries_;
+   uint32_t ready_reqs_;
+   uint32_t size_;
++  uint8_t ps_new_prio_ = 0;
+ };
+ 
+ class CacheBank : public SimObject<CacheBank> {
+@@ -658,6 +704,8 @@ public:
+     this->on_reset();
+   }
+ 
++  const Cache::PsClassStats &ps_class_stats() const { return mshr_.ps_stats_; }   // PhaseShift (patch mem-class)
++
+   const Cache::PerfStats &perf_stats() const {
+     return perf_stats_;
+   }
+@@ -827,6 +875,7 @@ private:
+       bank_req.uuid    = root_peek.bank_req.uuid;
+       bank_req.mshr_id = mshr_id;
+       bank_req.data    = mem_rsp.data;
++      bank_req.flags.mem_class = root_peek.bank_req.flags.mem_class;   // PhaseShift: the fill's (first requester's) class
+       pipe_req_->push(bank_req);
+       ++pipe_fill_count_;
+       DT(3, this->name() << " fill-rsp: " << mem_rsp);
+@@ -938,6 +987,7 @@ private:
+             coalesced.byteen  = core_req.byteen;
+             coalesced.amo_cmp = core_req.amo_cmp;
+             coalesced.flags   = core_req.flags;
++            ++mshr_.ps_stats_.reqs[coalesced.flags.mem_class];   // PhaseShift (patch mem-class)
+             assert(!mshr_.full());
+             int id = mshr_.enqueue(coalesced, adm_set_id, adm_addr_tag, adm_sector);
+             // Drain-only join (ordering case): nothing will mark our entry —
+@@ -980,6 +1030,7 @@ private:
+       bank_req.byteen  = core_req.byteen;
+       bank_req.amo_cmp = core_req.amo_cmp;
+       bank_req.flags   = core_req.flags;
++      ++mshr_.ps_stats_.reqs[bank_req.flags.mem_class];   // PhaseShift (patch mem-class)
+       pipe_req_->push(bank_req);
+       DT(3, this->name() << " core-req: " << core_req);
+       // pending_mshr_size_ tracks Core-typed in-flight requests so the
+@@ -1060,6 +1111,7 @@ private:
+         wb.uuid   = bank_req.uuid;
+         wb.data   = sec.data;
+         wb.byteen = sec.dirty_mask;
++        wb.flags.mem_class = sec.ps_class;   // PhaseShift: a write-back carries its sector's class
+         this->mem_req_out.send(wb, MEM_REQ_DELAY);
+         DT(3, this->name() << " writeback: " << wb);
+         ++perf_stats_.evictions;
+@@ -1078,6 +1130,7 @@ private:
+     sec.dirty      = false;
+     sec.dirty_mask = 0;
+     sec.data       = bank_req.data;
++    sec.ps_class   = bank_req.flags.mem_class;   // PhaseShift: installed with the fill's class
+     mshr_.replay(bank_req.mshr_id);
+     // arm the fill-forward window for this chain
+     fwd_active_ = true;
+@@ -1198,6 +1251,7 @@ private:
+       amo_store_word(store_block->data(), byte_off, width, rmw.new_word);
+       uint64_t byteen = amo_byteen(byte_off, width);
+       sector_merge(hit_sec, store_block, byteen);
++      hit_sec.ps_class = bank_req.flags.mem_class;   // PhaseShift: last writer's class
+       if (config_.write_back) {
+         hit_sec.dirty = true;
+         hit_sec.dirty_mask |= byteen;
+@@ -1210,6 +1264,7 @@ private:
+         w.uuid   = bank_req.uuid;
+         w.data   = store_block;
+         w.byteen = byteen;
++        w.flags.mem_class = bank_req.flags.mem_class;   // PhaseShift
+         this->mem_req_out.send(w, MEM_REQ_DELAY);
+         DT(3, this->name() << " amo-writethrough: " << w);
+       }
+@@ -1235,7 +1290,7 @@ private:
+   bool emitWritethrough(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id,
+                         uint64_t full_addr, uint32_t hart_id, uint64_t uuid,
+                         const std::shared_ptr<mem_block_t>& data, uint64_t byteen,
+-                        bool need_rsp, uint64_t rsp_tag) {
++                        bool need_rsp, uint64_t rsp_tag, uint32_t mem_class) {
+     __unused(full_addr);
+     if (this->mem_req_out.full()) {
+       return false;
+@@ -1250,6 +1305,7 @@ private:
+     w.uuid    = uuid;
+     w.data    = data;
+     w.byteen  = byteen;
++    w.flags.mem_class = mem_class;   // PhaseShift: the store's class
+     this->mem_req_out.send(w, MEM_REQ_DELAY);
+     DT(3, this->name() << " writethrough: " << w);
+ #if VX_CFG_EXT_A_ENABLED
+@@ -1329,6 +1385,7 @@ private:
+         wb.uuid   = bank_req.uuid;
+         wb.data   = sec.data;
+         wb.byteen = sec.dirty_mask;
++        wb.flags.mem_class = sec.ps_class;   // PhaseShift
+         this->mem_req_out.send(wb, MEM_REQ_DELAY);
+         DT(3, this->name() << " amo-probe-wb: " << wb);
+         ++perf_stats_.evictions;
+@@ -1416,6 +1473,7 @@ private:
+           fill.tag     = mshr_id;
+           fill.hart_id = bank_req.hart_id;
+           fill.uuid    = bank_req.uuid;
++          fill.flags.mem_class = bank_req.flags.mem_class;   // PhaseShift: fill carries its first requester's class
+           this->mem_req_out.send(fill, MEM_REQ_DELAY);
+           ++pending_fill_reqs_;
+         }
+@@ -1447,6 +1505,7 @@ private:
+           assert(bank_req.skip_core_rsp && "WT replay without pre-sent store");
+         }
+         sector_merge(hit_sec, bank_req.data, bank_req.byteen);
++        hit_sec.ps_class = bank_req.flags.mem_class;   // PhaseShift: last writer's class
+         if (config_.write_back) {
+           hit_sec.dirty = true;
+           hit_sec.dirty_mask |= bank_req.byteen;
+@@ -1505,7 +1564,8 @@ private:
+             if (!this->emitWritethrough(set_id, addr_tag, sector_id,
+                                         bank_req.addr, bank_req.hart_id, bank_req.uuid,
+                                         bank_req.data, bank_req.byteen,
+-                                        need_core_rsp(bank_req), bank_req.req_tag)) {
++                                        need_core_rsp(bank_req), bank_req.req_tag,
++                                        bank_req.flags.mem_class)) {
+               return;
+             }
+             bank_req_t merge_req = bank_req;
+@@ -1549,6 +1609,7 @@ private:
+         auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
+         if (bank_req.write) {
+           sector_merge(hit_sec, bank_req.data, bank_req.byteen);
++          hit_sec.ps_class = bank_req.flags.mem_class;   // PhaseShift: last writer's class
+           if (config_.write_back) {
+             hit_sec.dirty = true;
+             hit_sec.dirty_mask |= bank_req.byteen;
+@@ -1560,6 +1621,7 @@ private:
+             w.uuid   = bank_req.uuid;
+             w.data   = bank_req.data;
+             w.byteen = bank_req.byteen;
++            w.flags.mem_class = bank_req.flags.mem_class;   // PhaseShift
+             this->mem_req_out.send(w, MEM_REQ_DELAY);
+             DT(3, this->name() << " writethrough: " << w);
+ #if VX_CFG_EXT_A_ENABLED
+@@ -1603,7 +1665,8 @@ private:
+           if (!this->emitWritethrough(set_id, addr_tag, sector_id,
+                                       bank_req.addr, bank_req.hart_id, bank_req.uuid,
+                                       bank_req.data, bank_req.byteen,
+-                                      need_core_rsp(bank_req), bank_req.req_tag)) {
++                                      need_core_rsp(bank_req), bank_req.req_tag,
++                                      bank_req.flags.mem_class)) {
+             return;
+           }
+           if (fill_pending) {
+@@ -1633,6 +1696,9 @@ private:
+             fill.tag   = mshr_id; // routes the fill response back here
+             fill.hart_id   = bank_req.hart_id;
+             fill.uuid  = bank_req.uuid;
++            // PhaseShift (patch mem-class): the fill carries the class of the request that allocated the chain (its
++            // first requester); later joiners only raise the chain priority (MSHR::enqueue, methodology §12).
++            fill.flags.mem_class = bank_req.flags.mem_class;
+             this->mem_req_out.send(fill, MEM_REQ_DELAY);
+             DT(3, this->name() << " fill-req: " << fill);
+             ++pending_fill_reqs_;
+@@ -1681,6 +1747,7 @@ private:
+             mem_req.op   = MemOp::ST;
+             mem_req.data = sec.data;
+             mem_req.byteen = sec.dirty_mask;
++            mem_req.flags.mem_class = sec.ps_class;   // PhaseShift
+             this->mem_req_out.send(mem_req, MEM_REQ_DELAY);
+             DT(3, this->name() << " flush-wb: " << mem_req);
+             ++perf_stats_.evictions;
+@@ -1888,13 +1955,35 @@ public:
+           core_req_in.pop();
+         }
+       } else {
+-        if (bank_core_xbar_->ReqIn.at(req_id).try_send(core_req, 0)) {
++        // PhaseShift (patch mem-class): an unhinted (ORDINARY) request is classified by the [dcr_phase] KV/weight
++        // address ranges at the first non-bypass cache it enters (methodology §12). Idempotent at later levels; with
++        // empty ranges (the reset value) or VX_PHASE_FLAG_RANGE_ACCT_ONLY the request passes unchanged.
++        const PhaseConfig& pc = simobject_->phase_config();
++        uint32_t rcls = (core_req.flags.mem_class == VX_PS_CLASS_ORDINARY) ? pc.range_class(core_req.addr)
++                                                                            : VX_PS_CLASS_ORDINARY;
++        if (rcls != VX_PS_CLASS_ORDINARY) {
++          MemReq creq(core_req);
++          creq.flags.mem_class = rcls;
++          if (bank_core_xbar_->ReqIn.at(req_id).try_send(creq, 0)) {
++            core_req_in.pop();
++          }
++        } else if (bank_core_xbar_->ReqIn.at(req_id).try_send(core_req, 0)) {
+           core_req_in.pop();
+         }
+       }
+     }
+   }
+ 
++  Cache::PsClassStats ps_class_stats() const {   // PhaseShift (patch mem-class)
++    Cache::PsClassStats st;
++    if (!config_.bypass) {
++      for (const auto &bank : banks_) {
++        st += bank->ps_class_stats();
++      }
++    }
++    return st;
++  }
++
+   PerfStats perf_stats() const {
+     PerfStats perf_stats;
+     if (!config_.bypass) {
+@@ -1975,6 +2064,10 @@ void Cache::on_tick() {
+   impl_->tick();
+ }
+ 
++Cache::PsClassStats Cache::ps_class_stats() const {
++  return impl_->ps_class_stats();
++}
++
+ Cache::PerfStats Cache::perf_stats() const {
+   return impl_->perf_stats();
+ }
+diff --git a/sim/simx/mem/cache.h b/sim/simx/mem/cache.h
+index 5a13cde73..2e01e4918 100644
+--- a/sim/simx/mem/cache.h
++++ b/sim/simx/mem/cache.h
+@@ -69,6 +69,25 @@ public:
+ 		}
+ 	};
+ 
++	// PhaseShift (patch mem-class): request-class accounting (instrumentation only, never read by the timing model).
++	// Cumulative since device construction (like the MPM counters); reported with PS_DEBUG_CLASS=1.
++	//   reqs[c]        core-side requests admitted by the cache's banks, by class (after range classification)
++	//   mixed_merges   requests that joined an MSHR chain whose first requester has a different class
++	//   prio_upgrades  of those, joins that raised the chain priority (methodology §12 merge rule)
++	struct PsClassStats {
++		uint64_t reqs[VX_PS_NUM_CLASSES] = {};
++		uint64_t mixed_merges = 0;
++		uint64_t prio_upgrades = 0;
++
++		PsClassStats& operator+=(const PsClassStats& rhs) {
++			for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c)
++				this->reqs[c] += rhs.reqs[c];
++			this->mixed_merges += rhs.mixed_merges;
++			this->prio_upgrades += rhs.prio_upgrades;
++			return *this;
++		}
++	};
++
+ 	std::vector<SimChannel<MemReq>> core_req_in;
+ 	std::vector<SimChannel<MemRsp>> core_rsp_out;
+ 	std::vector<SimChannel<MemReq>> mem_req_out;
+@@ -79,6 +98,9 @@ public:
+ 
+ 	PerfStats perf_stats() const;
+ 
++	// PhaseShift (patch mem-class): see PsClassStats.
++	PsClassStats ps_class_stats() const;
++
+ 	// Flush API: arm a write-back walk that emits dirty lines via mem_req_out.
+ 	// flush_done() returns true once the walk completes; the caller is expected
+ 	// to tick the simulator until then. Write-through caches no-op.
+diff --git a/sim/simx/mem/memory.cpp b/sim/simx/mem/memory.cpp
+index 0b5e857ea..7333f1497 100644
+--- a/sim/simx/mem/memory.cpp
++++ b/sim/simx/mem/memory.cpp
+@@ -44,6 +44,9 @@ private:
+ 	RAM*      ram_;
+ 	Memory::PreSendHook pre_send_hook_;
+ 	mutable PerfStats perf_stats_;
++	// PhaseShift (patch mem-class): DRAM bytes per ([dcr_phase] accounting region, class), cumulative since
++	// construction; region = PhaseConfig::region_of(request address) with the config latched at send time.
++	uint64_t ps_region_bytes_[PhaseConfig::NUM_REGIONS][VX_PS_NUM_CLASSES] = {};
+ 	struct DramCallbackArgs {
+ 		Memory::Impl* memsim;
+ 		MemReq request;
+@@ -129,6 +132,9 @@ public:
+ 			// enqueue the request to the memory system
+ 			auto req_args = new DramCallbackArgs{this, mem_req, i, rsp_data};
+ 			uint64_t bank_addr = ((mem_req.addr >> lg2_block_size) / num_banks) << lg2_block_size;
++			// PhaseShift (patch mem-class): per-region/class byte accounting (no timing effect)
++			ps_region_bytes_[dram_sim_.phase_config().region_of(mem_req.addr)][mem_req.flags.mem_class]
++				+= config_.dram.block_size;
+ 			dram_sim_.send_request(
+ 				i,
+ 				bank_addr,
+@@ -149,7 +155,8 @@ public:
+ 					}
+ 					return false; // stall
+ 				},
+-				req_args
++				req_args,
++				mem_req.flags.mem_class   // PhaseShift (patch mem-class): the request class reaches the DRAM model
+ 			);
+ 
+ 			DT(3, simobject_->name() << " mem-req" << i << ": " << mem_req);
+@@ -167,6 +174,9 @@ public:
+ 
+ 	DramSim& dram_sim() { return dram_sim_; }
+ 	const DramSim& dram_sim() const { return dram_sim_; }
++
++	uint64_t ps_region_bytes(uint32_t region, uint32_t cls) const { return ps_region_bytes_[region][cls]; }
++	uint32_t block_size() const { return config_.dram.block_size; }
+ };
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -208,4 +218,16 @@ void Memory::set_phase_config(const PhaseConfig& cfg) {
+ 
+ const PhaseConfig& Memory::phase_config() const {
+ 	return impl_->dram_sim().phase_config();
++}
++
++uint64_t Memory::ps_class_bytes(uint32_t cls, bool is_write) const {
++	return impl_->dram_sim().ps_class_reqs(cls, is_write) * impl_->block_size();
++}
++
++uint64_t Memory::ps_region_bytes(uint32_t region, uint32_t cls) const {
++	return impl_->ps_region_bytes(region, cls);
++}
++
++uint32_t Memory::block_size() const {
++	return impl_->block_size();
+ }
+\ No newline at end of file
+diff --git a/sim/simx/mem/memory.h b/sim/simx/mem/memory.h
+index c5fb280bb..2d21e502f 100644
+--- a/sim/simx/mem/memory.h
++++ b/sim/simx/mem/memory.h
+@@ -63,6 +63,12 @@ public:
+ 	void set_phase_config(const PhaseConfig& cfg);
+ 	const PhaseConfig& phase_config() const;
+ 
++	// PhaseShift (patch mem-class): DRAM bytes by class (counted by DramSim at send_request; reads or writes) and by
++	// ([dcr_phase] accounting region, class); cumulative since construction. Reported with PS_DEBUG_CLASS=1.
++	uint64_t ps_class_bytes(uint32_t cls, bool is_write) const;
++	uint64_t ps_region_bytes(uint32_t region, uint32_t cls) const;
++	uint32_t block_size() const;
++
+ protected:
+ 	void on_reset();
+ 	void on_tick();
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index 568244620..9d0a31ebb 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -15,6 +15,7 @@
+ #include "processor_impl.h"
+ #include "core.h"
+ #include "scheduler.h"
++#include "socket.h"   // PhaseShift (patch mem-class): PsClassCollect
+ #include <VX_types.h>
+ #ifdef VX_CFG_EXT_RTU_ENABLE
+ #include "rtu_raylog.h"
+@@ -195,6 +196,19 @@ ProcessorImpl::ProcessorImpl()
+     const char* e = std::getenv("PS_DUMP_PHASE");
+     phase_dump_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
+   }
++  // PhaseShift (patch mem-class): PS_DEBUG_CLASS=1 prints the request-class accounting at the end of every launch and
++  // after every cache flush (debug only; counting and printing do not change simulated timing). Also a run-time
++  // check of the MemFlags layout (the compile-time checks are in types.h): mem_class must be bits 21-23.
++  {
++    const char* e = std::getenv("PS_DEBUG_CLASS");
++    ps_debug_class_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
++    MemFlags f;
++    f.mem_class = 7;
++    if (f.raw != MemFlags::MEM_CLASS_MASK) {
++      std::cerr << "Error: MemFlags.mem_class layout (raw=0x" << std::hex << f.raw << std::dec << ")" << std::endl;
++      std::abort();
++    }
++  }
+ 
+   // reset the device
+   this->reset();
+@@ -318,9 +332,66 @@ int ProcessorImpl::run() {
+     perf_mem_latency_ += perf_mem_pending_reads_;
+   } while (!done);
+ 
++  if (ps_debug_class_)
++    this->ps_class_report("end");
+   return exitcode;
+ }
+ 
++void ProcessorImpl::ps_class_report(const char* when) const {
++  // PhaseShift (patch mem-class) PS_DEBUG_CLASS report; parsed by scripts/psclass.py. All counters are cumulative since
++  // device open except the ps_mark counts, which are per launch. Byte counts: one DRAM request = one block.
++  const uint64_t launch = phase_launches_ ? phase_launches_ - 1 : 0;
++  const uint64_t blk = memsim_->block_size();
++  auto list = [](const uint64_t* v, uint32_t n) {
++    std::string out;
++    for (uint32_t i = 0; i < n; ++i) {
++      if (i) out += ",";
++      out += std::to_string(v[i]);
++    }
++    return out;
++  };
++  uint64_t rd[VX_PS_NUM_CLASSES], wr[VX_PS_NUM_CLASSES];
++  for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) {
++    rd[c] = memsim_->ps_class_bytes(c, false);
++    wr[c] = memsim_->ps_class_bytes(c, true);
++  }
++  std::cout << "PSCLASS launch=" << launch << " when=" << when << " block=" << blk
++            << " dram_total_bytes=" << (perf_mem_reads_ + perf_mem_writes_) * blk
++            << " dram_rd_bytes=" << list(rd, VX_PS_NUM_CLASSES)
++            << " dram_wr_bytes=" << list(wr, VX_PS_NUM_CLASSES) << std::endl;
++  static const char* const kRegion[PhaseConfig::NUM_REGIONS] = {"kv0", "kv1", "wgt", "other"};
++  for (uint32_t r = 0; r < PhaseConfig::NUM_REGIONS; ++r) {
++    uint64_t b[VX_PS_NUM_CLASSES];
++    for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c)
++      b[c] = memsim_->ps_region_bytes(r, c);
++    std::cout << "PSCLASS-REGION launch=" << launch << " when=" << when << " region=" << kRegion[r]
++              << " bytes=" << list(b, VX_PS_NUM_CLASSES) << std::endl;
++  }
++  PsClassCollect col;
++  for (auto& cluster : clusters_)
++    cluster->ps_collect(col);
++  Cache::PsClassStats l3 = l3cache_->ps_class_stats();
++  const std::pair<const char*, const Cache::PsClassStats*> levels[] = {
++    {"l1i", &col.l1i}, {"l1d", &col.l1d}, {"l2", &col.l2}, {"l3", &l3}};
++  for (auto& lv : levels) {
++    std::cout << "PSCLASS-CACHE launch=" << launch << " when=" << when << " level=" << lv.first
++              << " reqs=" << list(lv.second->reqs, VX_PS_NUM_CLASSES)
++              << " mixed_merges=" << lv.second->mixed_merges
++              << " prio_upgrades=" << lv.second->prio_upgrades << std::endl;
++  }
++  std::cout << "PSCLASS-DXA launch=" << launch << " when=" << when
++            << " gmem_reqs=" << list(col.dxa_gmem, VX_PS_NUM_CLASSES) << std::endl;
++  uint64_t tot[VX_PS_NUM_MARK_TYPES] = {};
++  for (auto& cm : col.marks) {
++    std::cout << "PSMARK launch=" << launch << " when=" << when << " core=" << cm.first
++              << " counts=" << list(cm.second.data(), VX_PS_NUM_MARK_TYPES) << std::endl;
++    for (uint32_t t = 0; t < VX_PS_NUM_MARK_TYPES; ++t)
++      tot[t] += cm.second[t];
++  }
++  std::cout << "PSMARK-TOTAL launch=" << launch << " when=" << when
++            << " counts=" << list(tot, VX_PS_NUM_MARK_TYPES) << std::endl;
++}
++
+ bool ProcessorImpl::mmu_fault_pending() const {
+ #ifdef VX_CFG_VM_ENABLE
+   return dev_ptw_->fault_info().valid;
+@@ -433,6 +504,8 @@ int ProcessorImpl::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+     // After flush_caches() returns every dirty line has reached memsim_'s
+     // backing RAM.
+     this->flush_caches();
++    if (ps_debug_class_)
++      this->ps_class_report("flush");   // PhaseShift (patch mem-class): includes the flush write-backs
+     *value = 0;
+     return 0;
+   }
+diff --git a/sim/simx/processor_impl.h b/sim/simx/processor_impl.h
+index f1ae53fd0..3fdfa70ac 100644
+--- a/sim/simx/processor_impl.h
++++ b/sim/simx/processor_impl.h
+@@ -93,6 +93,8 @@ private:
+     }
+   }
+   void dump_phase_config() const;
++  // PhaseShift (patch mem-class): PS_DEBUG_CLASS report (when = "end" of a launch or "flush").
++  void ps_class_report(const char* when) const;
+ 
+   Kmu::Ptr    kmu_;
+   std::vector<Cluster::Ptr> clusters_;
+@@ -120,6 +122,7 @@ private:
+   uint64_t    phase_launches_ = 0;
+   bool        phase_dump_ = false;
+   bool        phase_dump_pending_ = false;
++  bool        ps_debug_class_ = false;   // PhaseShift (patch mem-class): PS_DEBUG_CLASS (read once at construction)
+ };
+ 
+ }
+diff --git a/sim/simx/scheduler.cpp b/sim/simx/scheduler.cpp
+index 551adf697..a140b149e 100644
+--- a/sim/simx/scheduler.cpp
++++ b/sim/simx/scheduler.cpp
+@@ -54,6 +54,7 @@ void warp_t::reset() {
+   this->mepc    = 0;
+   this->mcause  = 0;
+   this->mtval   = 0;
++  this->ps_mem_hint = 0;   // PhaseShift (patch mem-class)
+   // Register files live in OpcUnit and are reset there.
+ }
+ 
+@@ -117,6 +118,7 @@ void Scheduler::activate_warp(uint32_t wid, const cta_warp_record_t& rec) {
+   warp.PC       = rec.do_init ? rec.PC : (warp.PC - 20);
+   warp.tmask    = rec.tmask;
+   warp.mscratch = rec.mscratch;
++  warp.ps_mem_hint = 0;   // PhaseShift (patch mem-class): a new CTA starts unhinted
+ 
+   warp.cta_csrs.cta_id        = rec.cta_id;
+   warp.cta_csrs.cta_rank      = rec.cta_rank;
+@@ -191,6 +193,7 @@ instr_trace_t* Scheduler::schedule(const WarpMask& warp_mask) {
+       warp.PC = wspawn_.nextPC;
+       warp.tmask.set(0);
+       warp.mscratch = spawning_mscratch;
++      warp.ps_mem_hint = 0;   // PhaseShift (patch mem-class)
+       active_warps_.set(i);
+       // wspawn activation, like CTA dispatch: immediate (both current + next).
+       stalled_warps_.reset(i);
+diff --git a/sim/simx/scheduler.h b/sim/simx/scheduler.h
+index a397eb60b..f51895418 100644
+--- a/sim/simx/scheduler.h
++++ b/sim/simx/scheduler.h
+@@ -97,6 +97,10 @@ struct warp_t {
+   // CTA CSR values set at dispatch time
+   cta_csrs_t                        cta_csrs;
+ 
++  // PhaseShift (patch mem-class): per-warp request class of this warp's loads/stores (VX_CSR_PS_MEM_HINT;
++  // VX_PS_CLASS_*, 0 = unset). Cleared at reset and at every CTA dispatch / wspawn activation.
++  uint32_t                          ps_mem_hint = 0;
++
+ #ifdef VX_CFG_EXT_RASTER_ENABLE
+   // Per-lane fragment stamp, delivered WITH the launch (the raster engine packs
+   // it into the launch message) and read back as the FRAG_* CSRs. The shader no
+diff --git a/sim/simx/socket.cpp b/sim/simx/socket.cpp
+index ba44a8507..c4969254d 100644
+--- a/sim/simx/socket.cpp
++++ b/sim/simx/socket.cpp
+@@ -419,6 +419,23 @@ public:
+ #endif
+   }
+ 
++  void ps_collect(PsClassCollect& out) const {
++    for (auto& cache : icaches_->caches())
++      out.l1i += cache->ps_class_stats();
++    for (auto& cache : dcaches_->caches())
++      out.l1d += cache->ps_class_stats();
++#ifdef VX_CFG_EXT_DXA_ENABLE
++    for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c)
++      out.dxa_gmem[c] += dxa_core_->ps_gmem_reqs(c);
++#endif
++    for (auto& core : cores_) {
++      std::array<uint64_t, VX_PS_NUM_MARK_TYPES> m{};
++      for (uint32_t t = 0; t < VX_PS_NUM_MARK_TYPES; ++t)
++        m[t] = core->ps_mark_count(t);
++      out.marks.emplace_back(core->id(), m);
++    }
++  }
++
+   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+     for (auto& core : cores_) {
+       uint16_t core_id = tag & 0xfffff;
+@@ -525,6 +542,10 @@ void Socket::for_each_phase_consumer(const PhaseVisitor& visit) const {
+   impl_->for_each_phase_consumer(visit);
+ }
+ 
++void Socket::ps_collect(PsClassCollect& out) const {
++  impl_->ps_collect(out);
++}
++
+ Core::Ptr& Socket::core(uint32_t idx) {
+   return impl_->core(idx);
+ }
+diff --git a/sim/simx/socket.h b/sim/simx/socket.h
+index 6d23f80af..a2627ed79 100644
+--- a/sim/simx/socket.h
++++ b/sim/simx/socket.h
+@@ -30,6 +30,14 @@ namespace vortex {
+ class Cluster;
+ class Core;
+ 
++// PhaseShift (patch mem-class): request-class accounting gathered over the device for the PS_DEBUG_CLASS report
++// (ProcessorImpl). Cache stats are summed over every L1 icache / dcache / L2 instance; marks are per core (core id).
++struct PsClassCollect {
++  Cache::PsClassStats l1i, l1d, l2;
++  uint64_t dxa_gmem[VX_PS_NUM_CLASSES] = {};
++  std::vector<std::pair<uint32_t, std::array<uint64_t, VX_PS_NUM_MARK_TYPES>>> marks;   // (core id, counts)
++};
++
+ class Socket : public SimObject<Socket> {
+ public:
+   struct PerfStats {
+@@ -75,6 +83,9 @@ public:
+   // PhaseShift (patch dcr-phase): visit every [dcr_phase] consumer of this socket (L1 caches, DXA).
+   void for_each_phase_consumer(const PhaseVisitor& visit) const;
+ 
++  // PhaseShift (patch mem-class): add this socket's class counters and ps_mark counts to `out`.
++  void ps_collect(PsClassCollect& out) const;
++
+   std::shared_ptr<Core>& core(uint32_t idx);
+ 
+   // Forwarded cache flush (write-back eviction walk). The walk is a no-op
+diff --git a/sim/simx/types.h b/sim/simx/types.h
+index 31f7fbddb..45fc1213e 100644
+--- a/sim/simx/types.h
++++ b/sim/simx/types.h
+@@ -436,26 +436,53 @@ inline bool memop_is_write(MemOp op) {
+ inline bool memop_is_amo(MemOp op) { return memop_is_atomic(op); }
+ 
+ // Memory-request flags.
++//
++// PhaseShift (patch mem-class): bits 21-23 carry the request class (VX_PS_CLASS_*, VX_types.toml
++// [ps_mem_class]; class rules in docs/methodology.md §12). The class sits at the SAME bits whether or not DXA is
++// built: without DXA a 17-bit pad takes the place of the DXA completion sideband (bits 4-20), and bits 24-31 are an
++// explicit reserved field, so the struct covers all 32 bits. The field list is written once (VX_MEM_FLAGS_FIELDS) and
++// instantiated twice: as the anonymous struct inside the union (the members code uses) and as MemFlagsLayout, a plain
++// struct on which the bit positions are checked at compile time (static_asserts below). A class never changes the
++// simulated timing in this patch; it is carried and counted only (mechanism patches read it).
++#ifdef VX_CFG_EXT_DXA_ENABLE
++  // DXA completion sideband — populated only on DXA's LMEM-DMA writes.
++  // notify_bar_id carries the RAW (kernel-encoded) bar handle:
++  //   bits[7:0]   = cta_local_id (= get_local_group_id())
++  //   bits[N+7:8] = user bar_no (N = CLOG2(NUM_BARRIERS))
++  // Multicast adds cta_warp_idx into the low byte, so the field must
++  // be wide enough to hold (bar_no << 8) | (MAX_CTAS_per_core - 1).
++  // For NUM_BARRIERS = 8 and NUM_WARPS ≤ 16, that's at most 11 bits;
++  // 16 bits leaves headroom for larger configs.
++  #define VX_MEM_FLAGS_MID_FIELDS \
++      uint32_t dxa_notify_done   : 1;   /* bit 4 */ \
++      uint32_t dxa_notify_bar_id : 16;  /* bits 5..20 */
++#else
++  #define VX_MEM_FLAGS_MID_FIELDS \
++      uint32_t ps_pad_dxa        : 17;  /* bits 4..20: DXA sideband slot (PhaseShift pad, keeps mem_class fixed) */
++#endif
++#define VX_MEM_FLAGS_FIELDS \
++    uint32_t strsp        : 1;  /* bit 0: store-response enabled (opt-in) */ \
++    uint32_t io           : 1;  /* bit 1: uncacheable I/O */ \
++    uint32_t local        : 1;  /* bit 2: LMEM port */ \
++    uint32_t amo_unsigned : 1;  /* bit 3: MIN/MAX signedness (1=unsigned) */ \
++    VX_MEM_FLAGS_MID_FIELDS \
++    uint32_t mem_class    : 3;  /* bits 21..23: PhaseShift request class (VX_PS_CLASS_*) */ \
++    uint32_t ps_rsvd      : 8;  /* bits 24..31: reserved (zero) */
++
++// Plain-struct twin of MemFlags' bit-field list (compile-time layout checks only).
++struct MemFlagsLayout {
++  VX_MEM_FLAGS_FIELDS
++};
++
+ struct MemFlags {
++  static constexpr uint32_t MEM_CLASS_SHIFT = 21;
++  static constexpr uint32_t MEM_CLASS_BITS  = 3;
++  static constexpr uint32_t MEM_CLASS_MASK  = ((1u << MEM_CLASS_BITS) - 1) << MEM_CLASS_SHIFT;
++
+   union {
+     uint32_t raw;
+     struct {
+-      uint32_t strsp        : 1;  // bit 0: store-response enabled (opt-in)
+-      uint32_t io           : 1;  // bit 1: uncacheable I/O
+-      uint32_t local        : 1;  // bit 2: LMEM port
+-      uint32_t amo_unsigned : 1;  // bit 3: MIN/MAX signedness (1=unsigned)
+-    #ifdef VX_CFG_EXT_DXA_ENABLE
+-      // DXA completion sideband — populated only on DXA's LMEM-DMA writes.
+-      // notify_bar_id carries the RAW (kernel-encoded) bar handle:
+-      //   bits[7:0]   = cta_local_id (= get_local_group_id())
+-      //   bits[N+7:8] = user bar_no (N = CLOG2(NUM_BARRIERS))
+-      // Multicast adds cta_warp_idx into the low byte, so the field must
+-      // be wide enough to hold (bar_no << 8) | (MAX_CTAS_per_core - 1).
+-      // For NUM_BARRIERS = 8 and NUM_WARPS ≤ 16, that's at most 11 bits;
+-      // 16 bits leaves headroom for larger configs.
+-      uint32_t dxa_notify_done   : 1;   // bit 4
+-      uint32_t dxa_notify_bar_id : 16;  // bits 5..20
+-    #endif
++      VX_MEM_FLAGS_FIELDS
+     };
+   };
+ 
+@@ -473,6 +500,26 @@ struct MemFlags {
+     return os;
+   }
+ };
++#undef VX_MEM_FLAGS_FIELDS
++#undef VX_MEM_FLAGS_MID_FIELDS
++
++// PhaseShift: mem_class bit positions are identical with DXA on and off.
++static_assert(sizeof(MemFlagsLayout) == sizeof(uint32_t), "MemFlagsLayout must be 32-bit");
++static_assert(MemFlags::MEM_CLASS_SHIFT == 21 && MemFlags::MEM_CLASS_BITS == 3, "mem_class must be bits 21-23");
++static_assert(VX_PS_NUM_CLASSES == (1u << MemFlags::MEM_CLASS_BITS), "VX_PS_NUM_CLASSES must match the field width");
++#if defined(__GNUC__) && !defined(__clang__)
++// GCC evaluates __builtin_bit_cast of bit-fields in constant expressions (clang does not yet), so on the host compiler
++// that builds SimX the exact bit positions of every field are asserted, for whichever DXA setting this TU sees.
++namespace ps_layout_check {
++constexpr MemFlagsLayout with_class(uint32_t c) { MemFlagsLayout f{}; f.mem_class = c; return f; }
++constexpr MemFlagsLayout with_amo() { MemFlagsLayout f{}; f.amo_unsigned = 1; return f; }
++constexpr MemFlagsLayout with_rsvd() { MemFlagsLayout f{}; f.ps_rsvd = 1; return f; }
++static_assert(__builtin_bit_cast(uint32_t, with_class(1)) == (1u << 21), "mem_class must start at bit 21");
++static_assert(__builtin_bit_cast(uint32_t, with_class(7)) == MemFlags::MEM_CLASS_MASK, "mem_class must be bits 21-23");
++static_assert(__builtin_bit_cast(uint32_t, with_amo()) == (1u << 3), "amo_unsigned must stay at bit 3");
++static_assert(__builtin_bit_cast(uint32_t, with_rsvd()) == (1u << 24), "reserved field must start at bit 24");
++}  // namespace ps_layout_check
++#endif
+ static_assert(sizeof(MemFlags) == sizeof(uint32_t), "MemFlags must be 32-bit");
+ 
+ inline std::ostream &operator<<(std::ostream &os, const MemOp& op) {

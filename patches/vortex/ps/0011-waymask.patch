@@ -1,0 +1,359 @@
+diff --git a/sim/common/phase_config.h b/sim/common/phase_config.h
+index fe0fc3571..3b8eeb583 100644
+--- a/sim/common/phase_config.h
++++ b/sim/common/phase_config.h
+@@ -16,8 +16,8 @@
+ //   flags         bit 0 VX_PHASE_FLAG_PERSIST_L2 (sensitivity knob; never set by default); bit 1
+ //                 VX_PHASE_FLAG_RANGE_ACCT_ONLY (patch mem-class: ranges for accounting only); bit 2 + bits 31:16
+ //                 FDP-lite DXA policy + its epoch (patch fdp-lite, FLAG_DXA_FDP below); other bits reserved
+-//   l1_waymask    L1 dcache allowed-way mask (0 = all ways, stock)
+-//   l2_waymask    L2 allowed-way mask (0 = all ways, stock)
++//   l1_waymask    L1 dcache allowed-victim way masks (0 = all ways, stock; encoding: patch waymask, below)
++//   l2_waymask    L2 allowed-victim way masks (0 = all ways, stock; encoding: patch waymask, below)
+ //   insert_policy L2 insertion policy for mechanism D and its baselines (0 = stock; encoding below, patch kv-insert)
+ //   dxa_depth[c]  DXA in-flight depth limit for request class c = 0..7 (8 bits each; 0 = stock, unlimited)
+ //   dram_sched    DRAM scheduler mode for mechanism B (0 = stock)
+@@ -105,6 +105,33 @@ struct PhaseConfig {
+     return "";
+   }
+ 
++  // PhaseShift patch waymask (mechanism A2; semantics in docs/methodology.md §14.A). l1_waymask (L1
++  // dcaches only) and l2_waymask (the L2s only) share one encoding:
++  //   bits 15:0   allowed-victim way mask for every fill whose class is not WEIGHT (0 = all ways)
++  //   bits 31:16  allowed-victim way mask for WEIGHT-class fills (0 = the same mask as bits 15:0)
++  // A mask restricts only which way a fill may evict/occupy (allocation); lookups still search every way, so a line
++  // already resident in a disallowed way still hits (Intel CAT semantics, C42). A mask bit at or above the cache's
++  // associativity is rejected; so is a mask word != 0 together with a non-zero L2 insert policy (D and its baselines
++  // pick victims themselves) or with persist_l2 (lines would survive in ways the next launch's mask forbids). The
++  // mask is a launch-boundary knob: PS_SCHEDULE rejects it (ps_schedule.h), and the flush that ends every launch
++  // empties every way before the next launch's mask is in force.
++  static constexpr uint32_t WM_FIELD = 0xffff;
++  // Effective allowed-way mask for one fill: `word` = l1_waymask or l2_waymask, `ways` = associativity (<= 16).
++  static uint32_t wm_effective(uint32_t word, uint32_t ways, bool weight_fill) {
++    const uint32_t all = (ways >= 32) ? 0xffffffffu : ((1u << ways) - 1u);
++    uint32_t m = word & WM_FIELD;
++    if (weight_fill && (word >> 16) != 0) m = word >> 16;
++    return (m == 0) ? all : (m & all);
++  }
++  // Empty string if `word` is legal for a cache with `ways` ways, else the reason.
++  static const char* waymask_error(uint32_t word, uint32_t ways) {
++    if (ways > 16) return "way masks support at most 16 ways";
++    const uint32_t all = (1u << ways) - 1u;
++    if ((word & WM_FIELD) & ~all) return "bits 15:0 name a way >= associativity";
++    if ((word >> 16) & ~all) return "bits 31:16 name a way >= associativity";
++    return "";
++  }
++
+   // PhaseShift patch mem-class (rules in docs/methodology.md §12). Address-range classification: a
+   // request whose class is still ORDINARY (no mem_hint) is classified by the first range that contains its address,
+   // in the fixed order kv[0] -> KV_STREAM, kv[1] -> KV_PERSIST, wgt -> WEIGHT (the host programs kv[0] with the KV
+diff --git a/sim/simx/cluster.cpp b/sim/simx/cluster.cpp
+index 25579f4d9..d587477bc 100644
+--- a/sim/simx/cluster.cpp
++++ b/sim/simx/cluster.cpp
+@@ -91,6 +91,8 @@ public:
+     l2cache_->ps_set_persist_capable(true);
+     // PhaseShift (patch kv-insert): mechanism D and its baselines act at the L2 only
+     l2cache_->ps_set_insert_capable(true);
++    // PhaseShift (patch waymask): the L2 obeys [dcr_phase] l2_waymask (mechanism A2)
++    l2cache_->ps_set_waymask_level(2);
+ 
+ 
+     // connect l2cache memory interface
+diff --git a/sim/simx/kmu/kmu.h b/sim/simx/kmu/kmu.h
+index 537703601..80d022181 100644
+--- a/sim/simx/kmu/kmu.h
++++ b/sim/simx/kmu/kmu.h
+@@ -80,6 +80,10 @@ public:
+   // Distributor reuses it as the launch PC for injected fragment warps.
+   uint64_t startup_pc() const { return PC_; }
+ 
++  // PhaseShift (patch waymask, mechanism A1): the latched VX_DCR_KMU_LMEM_SIZE of the next/current
++  // launch (bytes of LMEM per CTA; the runtime writes it from vx_launch_info_t::lmem_size). Observation only.
++  uint32_t lmem_size() const { return lmem_size_; }
++
+ protected:
+   void on_reset();
+   void on_tick();
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+index 99b895e9a..bfad93e32 100644
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -304,15 +304,27 @@ struct set_t {
+   }
+ 
+   // Choose a victim line for installing a fill. Does NOT mutate state.
++  // PhaseShift (patch waymask, mechanism A2; methodology §14.A): only ways whose bit is set in
++  // `way_mask` may be chosen (the caller passes a non-empty mask; all ways = stock). Free way: the lowest allowed
++  // free way. Else PLRU: the allowed way with the largest age (ties -> the higher way, as stock); FIFO / RANDOM: the
++  // (fifo_ptr mod k)-th / (rand_idx mod k)-th allowed way, k = number of allowed ways. With every way allowed each
++  // rule reduces to the stock rule exactly (k = ways, the k-th allowed way = way k).
+   int select_victim(uint8_t policy, uint32_t rand_idx,
+-                    int *free_line_id, int *repl_line_id) const {
++                    int *free_line_id, int *repl_line_id, uint32_t way_mask = 0xffffffffu) const {
+     *free_line_id = -1;
+-    *repl_line_id = 0;
++    *repl_line_id = -1;
+ 
+     uint32_t max_cnt = 0;
+     bool has_valid = false;
++    uint32_t allowed = 0;
++    int first_allowed = -1;
+ 
+     for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
++      if (((way_mask >> i) & 1u) == 0)
++        continue;
++      ++allowed;
++      if (first_allowed == -1)
++        first_allowed = i;
+       const auto &line = lines.at(i);
+       if (!line.any_valid()) {
+         if (*free_line_id == -1)
+@@ -321,26 +333,42 @@ struct set_t {
+       }
+       has_valid = true;
+       if (policy == Cache::PLRU) {
+-        if (line.lru_ctr >= max_cnt) {
++        if (*repl_line_id == -1 || line.lru_ctr >= max_cnt) {
+           max_cnt = line.lru_ctr;
+           *repl_line_id = i;
+         }
+       }
+     }
++    if (first_allowed == -1)
++      first_allowed = 0;   // unreachable: callers never pass an empty mask (PhaseConfig::wm_effective)
++
++    // the k-th allowed way (k < allowed)
++    auto kth = [&](uint32_t k) -> int {
++      for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
++        if (((way_mask >> i) & 1u) == 0)
++          continue;
++        if (k == 0)
++          return (int)i;
++        --k;
++      }
++      return first_allowed;
++    };
+ 
+     switch (policy) {
+     case Cache::FIFO:
+-      *repl_line_id = fifo_ptr % lines.size();
++      *repl_line_id = kth(fifo_ptr % (allowed ? allowed : 1));
+       break;
+     case Cache::RANDOM:
+-      *repl_line_id = rand_idx % lines.size();
++      *repl_line_id = kth(rand_idx % (allowed ? allowed : 1));
+       break;
+     case Cache::PLRU:
+     default:
+       if (!has_valid)
+-        *repl_line_id = (*free_line_id != -1) ? *free_line_id : 0;
++        *repl_line_id = (*free_line_id != -1) ? *free_line_id : first_allowed;
+       break;
+     }
++    if (*repl_line_id == -1)
++      *repl_line_id = first_allowed;
+ 
+     return (*free_line_id != -1) ? *free_line_id : *repl_line_id;
+   }
+@@ -1306,7 +1334,20 @@ private:
+       } else if (ps_ins != 0 && ps_owner_->phase_config().ins_window()) {
+         line_id = set.ps_window_victim(ps_win_persist, ps_owner_->phase_config().ins_win_ways(set.lines.size()));
+       } else {
+-        line_id = set.select_victim(config_.repl_policy, rand_ctr_, &free_id, &repl_id);
++        // PhaseShift (patch waymask, mechanism A2): restrict the victim to the allowed ways of this fill's mask
++        const uint32_t wm_word = (ps_owner_ != nullptr) ? ps_owner_->ps_waymask() : 0u;
++        if (wm_word == 0) {
++          line_id = set.select_victim(config_.repl_policy, rand_ctr_, &free_id, &repl_id);
++        } else {
++          const bool wgt = (ps_cls == VX_PS_CLASS_WEIGHT);
++          const uint32_t wm = PhaseConfig::wm_effective(wm_word, set.lines.size(), wgt);
++          line_id = set.select_victim(config_.repl_policy, rand_ctr_, &free_id, &repl_id, wm);
++          auto &st = mshr_.ps_stats_;
++          ++st.wm_fills;
++          if (wgt) ++st.wm_fills_wgt;
++          if (((wm >> line_id) & 1u) == 0) ++st.wm_violations;   // independent re-check of the selection
++          st.wm_ways_used |= (1ull << line_id);
++        }
+       }
+       auto &victim_line = set.lines.at(line_id);
+ 
+diff --git a/sim/simx/mem/cache.h b/sim/simx/mem/cache.h
+index 183020f27..20eb7b3e2 100644
+--- a/sim/simx/mem/cache.h
++++ b/sim/simx/mem/cache.h
+@@ -94,6 +94,14 @@ public:
+ 		uint64_t link_wr[VX_PS_NUM_CLASSES] = {};
+ 		uint64_t fill_demoted[VX_PS_NUM_CLASSES] = {};
+ 		uint64_t fill_bypassed[VX_PS_NUM_CLASSES] = {};
++		// PhaseShift (patch waymask, methodology §14.A): victim selections of new lines (refills of a
++		// resident line excluded) made under a non-zero way-mask word, of those WEIGHT-class fills, victims outside
++		// the allowed mask (must stay 0; an independent re-check after select_victim) and the OR of the victim ways.
++		// Counted only when the cache's mask word is non-zero, so stock runs keep every counter 0.
++		uint64_t wm_fills = 0;
++		uint64_t wm_fills_wgt = 0;
++		uint64_t wm_violations = 0;
++		uint64_t wm_ways_used = 0;
+ 
+ 		PsClassStats& operator+=(const PsClassStats& rhs) {
+ 			for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) {
+@@ -106,6 +114,10 @@ public:
+ 			}
+ 			this->mixed_merges += rhs.mixed_merges;
+ 			this->prio_upgrades += rhs.prio_upgrades;
++			this->wm_fills += rhs.wm_fills;
++			this->wm_fills_wgt += rhs.wm_fills_wgt;
++			this->wm_violations += rhs.wm_violations;
++			this->wm_ways_used |= rhs.wm_ways_used;
+ 			return *this;
+ 		}
+ 	};
+@@ -153,6 +165,14 @@ public:
+ 	void ps_set_insert_capable(bool v) { ps_insert_capable_ = v; }
+ 	uint32_t ps_insert() const { return ps_insert_capable_ ? phase_cfg_.insert_policy : 0u; }
+ 
++	// PhaseShift (patch waymask, mechanism A2; methodology §14.A): which [dcr_phase] way-mask word this
++	// cache obeys: 0 none (every cache by default: icaches, L3, ...), 1 l1_waymask (the L1 dcaches, Socket), 2
++	// l2_waymask (the L2s, Cluster). ps_waymask() = the word in force (0 = all ways = stock).
++	void ps_set_waymask_level(uint8_t lvl) { ps_waymask_level_ = lvl; }
++	uint32_t ps_waymask() const {
++		return (ps_waymask_level_ == 1) ? phase_cfg_.l1_waymask : (ps_waymask_level_ == 2) ? phase_cfg_.l2_waymask : 0u;
++	}
++
+ protected:
+ 	void on_reset();
+ 	void on_tick();
+@@ -163,6 +183,7 @@ private:
+ 	PhaseConfig phase_cfg_;
+ 	bool ps_persist_capable_ = false;   // PhaseShift (patch sched-replay)
+ 	bool ps_insert_capable_ = false;    // PhaseShift (patch kv-insert)
++	uint8_t ps_waymask_level_ = 0;      // PhaseShift (patch waymask)
+ 	uint64_t ps_link_rd_[VX_PS_NUM_CLASSES] = {};   // PhaseShift (patch ps-counters), see ps_count_link_inputs()
+ 	uint64_t ps_link_wr_[VX_PS_NUM_CLASSES] = {};
+ 
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index 36b11fe1c..695b2f024 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -228,6 +228,13 @@ ProcessorImpl::ProcessorImpl()
+     }
+   }
+ 
++  // PhaseShift (patch waymask): PS_WAYMASK_REPORT=1 prints one PSLMEM line (mechanism A1: the launch's
++  // KMU LMEM size) at the start and PSWAYMASK lines (mechanism A2 counters, methodology §14.A) at the end of every
++  // launch (printing does not change timing; off by default so every earlier run prints the same).
++  {
++    const char* e = std::getenv("PS_WAYMASK_REPORT");
++    ps_waymask_report_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
++  }
+   // PhaseShift (patch ps-counters): PS_TRACE=<file> [PS_TRACE_UNIT=marks|instrs] [PS_TRACE_EVERY=<n>] writes the
+   // work-unit interval trace (methodology §12.10); the cores list feeds its work counter.
+   ps_trace_.reset(PsTrace::create_from_env());
+@@ -380,9 +387,52 @@ int ProcessorImpl::run() {
+     memsim_->ps_dram_report(phase_launches_ - 1);
+   if (ps_dxa_report_)
+     this->ps_dxa_report();
++  if (ps_waymask_report_)
++    this->ps_waymask_report();   // PhaseShift (patch waymask)
+   return exitcode;
+ }
+ 
++// PhaseShift (patch waymask, mechanism A2; methodology §14.A): reject an illegal way-mask config before a
++// launch (host config) or at a schedule switch (effective config). Checked here, on the whole config, and not per DCR
++// write, because the host writes the block register by register and an intermediate state may mix old and new fields.
++void ProcessorImpl::ps_waymask_check(const PhaseConfig& cfg, const char* where) const {
++  auto fail = [&](const char* what, uint32_t v, const char* why) {
++    std::cerr << "Error: [dcr_phase] " << what << "=0x" << std::hex << v << std::dec << " rejected (" << where
++              << "): " << why << std::endl;
++    std::abort();
++  };
++  if (cfg.l1_waymask == 0 && cfg.l2_waymask == 0)
++    return;
++  const char* err = PhaseConfig::waymask_error(cfg.l1_waymask, VX_CFG_DCACHE_NUM_WAYS);
++  if (err[0] != 0) fail("l1_waymask", cfg.l1_waymask, err);
++  err = PhaseConfig::waymask_error(cfg.l2_waymask, VX_CFG_L2_NUM_WAYS);
++  if (err[0] != 0) fail("l2_waymask", cfg.l2_waymask, err);
++  if (cfg.l1_waymask != 0 && !VX_CFG_DCACHE_ENABLED) fail("l1_waymask", cfg.l1_waymask, "the L1 dcache is disabled");
++  if (cfg.l2_waymask != 0 && !VX_CFG_L2_ENABLED) fail("l2_waymask", cfg.l2_waymask, "the L2 is disabled");
++  if (cfg.l2_waymask != 0 && cfg.insert_policy != 0)
++    fail("l2_waymask", cfg.l2_waymask, "exclusive with a non-zero L2 insert policy (mechanism D and its baselines)");
++  if (cfg.persist_l2())
++    fail(cfg.l2_waymask ? "l2_waymask" : "l1_waymask", cfg.l2_waymask ? cfg.l2_waymask : cfg.l1_waymask,
++         "exclusive with persist_l2 (lines would outlive the mask)");
++}
++
++void ProcessorImpl::ps_waymask_report() const {
++  PsClassCollect col;
++  for (auto& cluster : clusters_)
++    cluster->ps_collect(col);
++  const uint64_t launch = phase_launches_ ? phase_launches_ - 1 : 0;
++  const std::pair<const char*, const Cache::PsClassStats*> levels[] = {{"l1d", &col.l1d}, {"l2", &col.l2}};
++  for (auto& lv : levels) {
++    const uint32_t word = (lv.second == &col.l1d) ? phase_cfg_.l1_waymask : phase_cfg_.l2_waymask;
++    std::cout << "PSWAYMASK launch=" << launch << " level=" << lv.first << std::hex << " word=0x" << word
++              << " ways_used=0x" << lv.second->wm_ways_used << std::dec << " fills=" << lv.second->wm_fills
++              << " fills_wgt=" << lv.second->wm_fills_wgt << " violations=" << lv.second->wm_violations
++              << " reqs=" << [&] { std::string o; for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) { if (c) o += ","; o += std::to_string(lv.second->reqs[c]); } return o; }()
++              << " misses=" << [&] { std::string o; for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) { if (c) o += ","; o += std::to_string(lv.second->misses[c]); } return o; }()
++              << std::endl;
++  }
++}
++
+ void ProcessorImpl::ps_dxa_report() const {
+   // PhaseShift (patch dxa-class) PS_DXA_REPORT line; cumulative since device open (one launch per app run here).
+   PsClassCollect col;
+@@ -542,6 +592,10 @@ void ProcessorImpl::phase_begin_launch() {
+     this->ps_padc_counts(l, d);
+     memsim_->ps_padc_sync(l, d);
+   }
++  this->ps_waymask_check(phase_cfg_, "launch");   // PhaseShift (patch waymask)
++  if (ps_waymask_report_)
++    std::cout << "PSLMEM launch=" << (phase_launches_ - 1) << " lmem_size=" << kmu_->lmem_size()
++              << " lmem_capacity=" << (1u << VX_CFG_LMEM_LOG_SIZE) << std::endl;   // PhaseShift (patch waymask, A1)
+   if (phase_cfg_.persist_l2())
+     ++ps_persist_launches_;   // PhaseShift (patch sched-replay)
+   phase_dump_pending_ = phase_dump_;
+@@ -560,6 +614,7 @@ void ProcessorImpl::phase_begin_launch() {
+     this->ps_sched_end_launch();   // a cycle()-driven launch is never ended by run(): restore the host config first
+     ps_launch_instrs0_ = this->ps_instrs_total();
+     PhaseConfig eff = ps_sched_->begin_launch(phase_launches_ - 1, phase_cfg_);
++    this->ps_waymask_check(eff, "schedule launch start");   // PhaseShift (patch waymask)
+     if (ps_sched_->modified())
+       this->phase_push(eff);
+   }
+@@ -567,6 +622,7 @@ void ProcessorImpl::phase_begin_launch() {
+ 
+ void ProcessorImpl::ps_sched_switch() {
+   const PhaseConfig& eff = ps_sched_->apply_due(this->ps_sched_work(), SimPlatform::instance().cycles());
++  this->ps_waymask_check(eff, "schedule switch");   // PhaseShift (patch waymask): e.g. insert set under a mask
+   this->phase_push(eff);
+ }
+ 
+diff --git a/sim/simx/processor_impl.h b/sim/simx/processor_impl.h
+index 8ce8326c6..1f56e19bc 100644
+--- a/sim/simx/processor_impl.h
++++ b/sim/simx/processor_impl.h
+@@ -181,6 +181,9 @@ private:
+   bool        ps_dram_report_ = false;   // PhaseShift (patch dram-2class): PS_DRAM_REPORT (read once at construction)
+   bool        ps_dxa_report_ = false;    // PhaseShift (patch dxa-class): PS_DXA_REPORT (read once at construction)
+   bool        ps_debug_class_ = false;   // PhaseShift (patch mem-class): PS_DEBUG_CLASS (read once at construction)
++  bool        ps_waymask_report_ = false;   // PhaseShift (patch waymask): PS_WAYMASK_REPORT (read once at construction)
++  void        ps_waymask_check(const PhaseConfig& cfg, const char* where) const;   // PhaseShift (patch waymask)
++  void        ps_waymask_report() const;                                          // PhaseShift (patch waymask)
+   // PhaseShift (patch ps-counters)
+   std::unique_ptr<PsTrace> ps_trace_;      // PS_TRACE (read once at construction); null = no trace
+   std::vector<Core*>       ps_cores_;      // every core, for the trace's work counter
+diff --git a/sim/simx/socket.cpp b/sim/simx/socket.cpp
+index a280e12df..014b38d42 100644
+--- a/sim/simx/socket.cpp
++++ b/sim/simx/socket.cpp
+@@ -94,6 +94,9 @@ public:
+       VX_CFG_DCACHE_REPL_POLICY,     // replacement policy
+       (VX_CFG_DCACHE_ENABLED != 0) && (VX_CFG_L2_ENABLED == 0) && (VX_CFG_L3_ENABLED == 0), // is_llc
+     });
++    // PhaseShift (patch waymask): the L1 dcaches obey [dcr_phase] l1_waymask (mechanism A2)
++    for (auto& cache : dcaches_->caches())
++      cache->ps_set_waymask_level(1);
+ 
+ #ifdef VX_CFG_EXT_TEX_ENABLE
+     // ── Socket-resident TEX engine + tcache ─────────────────────────────

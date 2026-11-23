@@ -1,0 +1,19 @@
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index ccaf134fc..b60f8d5fa 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -420,8 +420,12 @@ void ProcessorImpl::ps_waymask_check(const PhaseConfig& cfg, const char* where)
+   if (err[0] != 0) fail("l2_waymask", cfg.l2_waymask, err);
+   if (cfg.l1_waymask != 0 && !VX_CFG_DCACHE_ENABLED) fail("l1_waymask", cfg.l1_waymask, "the L1 dcache is disabled");
+   if (cfg.l2_waymask != 0 && !VX_CFG_L2_ENABLED) fail("l2_waymask", cfg.l2_waymask, "the L2 is disabled");
+-  if (cfg.l2_waymask != 0 && cfg.insert_policy != 0)
+-    fail("l2_waymask", cfg.l2_waymask, "exclusive with a non-zero L2 insert policy (mechanism D and its baselines)");
++  // PhaseShift (patch compose, methodology §14.E): an L2 mask composes with mechanism D's own modes
++  // (insert bits 1:0 = insert-at-LRU or bypass): D only sets the replacement age of the line the masked victim
++  // selection installed (or never allocates it), so it never picks a victim itself. Every insert policy that picks or
++  // ages victims itself (rtl_like_fill, the window baseline, SRRIP, SHiP-Mem-lite) stays exclusive with a mask.
++  if (cfg.l2_waymask != 0 && (cfg.insert_policy & ~PhaseConfig::INS_D_MASK) != 0)
++    fail("l2_waymask", cfg.l2_waymask, "exclusive with an L2 insert policy other than D modes 1/2 (rtl_like_fill, window, SRRIP, SHiP)");
+   if (cfg.persist_l2())
+     fail(cfg.l2_waymask ? "l2_waymask" : "l1_waymask", cfg.l2_waymask ? cfg.l2_waymask : cfg.l1_waymask,
+          "exclusive with persist_l2 (lines would outlive the mask)");

@@ -1,0 +1,134 @@
+PhaseShift: real int8 dot4 instruction in SimX (decode + execute), custom-3 opcode 0x7B (Opcode::EXT4, defined but unused upstream).
+Applied ONLY to the fourth tree vortex-trees/psdot (scripts/mk_vortex_tree.sh --patchset ps --name psdot, then git apply --index). Never part of the base/ps patchsets.
+  DOT4    (funct7=0): rd  = sum_k int8(rs1.byte[k]) * int8(rs2.byte[k])          2 integer register reads
+  DOT4ACC (funct7=1): rd += sum_k int8(rs1.byte[k]) * int8(rs2.byte[k])          3 integer register reads (rd is the third source)
+Executed on the existing ALU block as MdvType::DOT4/DOT4ACC: latency kDot4Latency = PS_DOT4_LATENCY (default 3 = kMulDivLatency, the MUL pipe;
+build with -DPS_DOT4_LATENCY=4 via CONFIGS for one more adder-tree stage). Third source read: SimX fetches
+the operand VALUES in one step (operands.cpp), but its TIMING model charges every source read through the 4-bank GPR conflict model (OpcUnit::on_tick ->
+compute_bank_conflicts(), opc_unit.cpp:52-88: one stall per pair of non-x0 sources in the same bank, the pair loop covers all three sources), as for FMA, AMOCAS
+and WGATHER; Vortex RTL already routes rs3_data to the integer ALU (hw/rtl/core/VX_alu_int.sv:167). Unmodeled: datapath area / timing / power of the four
+8x8 multipliers plus the adder tree, and latency >= 5. DOT4 + add (2 reads) remains the conservative floor. RTL is NOT changed
+(see patches/vortex/rtl/ for the synthesis-only RTL datapath).
+
+diff --git a/sim/simx/types.h b/sim/simx/types.h
+index 45fc121..eb76a4d 100644
+--- a/sim/simx/types.h
++++ b/sim/simx/types.h
+@@ -349,7 +349,9 @@ enum class MdvType {
+   DIV,
+   DIVU,
+   REM,
+-  REMU
++  REMU,
++  DOT4,      // custom-3 (0x7B) funct7=0  rd  = dot4_s8(rs1, rs2)
++  DOT4ACC    // custom-3 (0x7B) funct7=1  rd += dot4_s8(rs1, rs2)   (rd is also a source)
+ };
+ 
+ struct IntrMdvArgs {
+@@ -366,6 +368,8 @@ inline std::ostream &operator<<(std::ostream &os, const MdvType& type) {
+   case MdvType::DIVU:   os << "DIVU"; break;
+   case MdvType::REM:    os << "REM"; break;
+   case MdvType::REMU:   os << "REMU"; break;
++  case MdvType::DOT4:   os << "DOT4"; break;
++  case MdvType::DOT4ACC: os << "DOT4ACC"; break;
+   default:
+     assert(false);
+   }
+diff --git a/sim/simx/decode.cpp b/sim/simx/decode.cpp
+index 630ae1b..0073c9c 100644
+--- a/sim/simx/decode.cpp
++++ b/sim/simx/decode.cpp
+@@ -183,6 +183,8 @@ static op_string_t op_string(const Instr &instr) {
+       case MdvType::DIVU:   return {mdvArgs.is_w ? "DIVUW":"DIVU", ""};
+       case MdvType::REM:    return {mdvArgs.is_w ? "REMW":"REM", ""};
+       case MdvType::REMU:   return {mdvArgs.is_w ? "REMUW":"REMU", ""};
++      case MdvType::DOT4:   return {"DOT4", ""};
++      case MdvType::DOT4ACC: return {"DOT4ACC", ""};
+       default:
+         std::abort();
+       }
+@@ -1190,6 +1192,21 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
+     // known-violation handoff class, checked against its decoded destination.
+     gfx_doctrine::check(*instr);
+   } break;
++  case Opcode::EXT4: {
++    // int8 dot4, custom-3 (0x7B), R-type, funct3 = 0. funct7 = 0: DOT4 (rd = dot4(rs1, rs2)); funct7 = 1: DOT4ACC
++    // (rd += dot4(rs1, rs2); rd is also read as the third source, i.e. a third integer register-file read).
++    if (funct3 != 0 || funct7 > 1) {
++      std::abort();
++    }
++    instr->set_op_type(funct7 == 0 ? MdvType::DOT4 : MdvType::DOT4ACC);
++    instr->set_args(IntrMdvArgs{0});
++    instr->set_dest_reg(rd, RegType::Integer);
++    instr->set_src_reg(0, rs1, RegType::Integer);
++    instr->set_src_reg(1, rs2, RegType::Integer);
++    if (funct7 == 1) {
++      instr->set_src_reg(2, rd, RegType::Integer);
++    }
++  } break;
+ #ifdef VX_CFG_EXT_MUFU_ENABLE
+   case Opcode::EXT3: {
+     if (funct7 != 0 || funct3 != 0 || rs2 > uint32_t(MufuType::TANH)) {
+diff --git a/sim/simx/alu_unit.h b/sim/simx/alu_unit.h
+index 6e2db38..a758a3f 100644
+--- a/sim/simx/alu_unit.h
++++ b/sim/simx/alu_unit.h
+@@ -22,6 +22,14 @@ public:
+   // Cycles the multiply/divide pipeline adds over the integer result stage.
+   static constexpr uint32_t kMulDivLatency = 3;
+ 
++  // latency of the DOT4 / DOT4ACC ops on the same pipe, cycles beyond the integer result stage. 3 = the multiplier
++  // pipeline (same as MUL); 4 = one more adder-tree stage. Build parameter -DPS_DOT4_LATENCY=<n> (via CONFIGS).
++#ifndef PS_DOT4_LATENCY
++#define PS_DOT4_LATENCY 3
++#endif
++  static constexpr uint32_t kDot4Latency = PS_DOT4_LATENCY;
++  static constexpr uint32_t kMaxLatency = kDot4Latency > kMulDivLatency ? kDot4Latency : kMulDivLatency;
++
+   // Partial bandwidth: a lane-gather stage registers the results once more.
+   static constexpr bool kGather = (VX_CFG_NUM_ALU_BLOCKS != VX_CFG_ISSUE_WIDTH)
+                                || (VX_CFG_NUM_ALU_LANES != VX_CFG_SIMD_WIDTH);
+diff --git a/sim/simx/alu_unit.cpp b/sim/simx/alu_unit.cpp
+index a48fc3e..efe3264 100644
+--- a/sim/simx/alu_unit.cpp
++++ b/sim/simx/alu_unit.cpp
+@@ -28,7 +28,7 @@ AluUnit::AluUnit(const SimContext& ctx, const char* name, Core* core)
+ 	// The output channel also counts results still in flight: it covers the
+ 	// deepest path plus the result waiting for the commit side, so the
+ 	// multiplier keeps one result per cycle.
+-	: FuncUnit<VX_CFG_NUM_ALU_BLOCKS>(ctx, name, core, kMulDivLatency + (kGather ? 1 : 0) + 2)
++	: FuncUnit<VX_CFG_NUM_ALU_BLOCKS>(ctx, name, core, kMaxLatency + (kGather ? 1 : 0) + 2)
+ 	, branch_ctl_out(this, VX_CFG_NUM_WARPS)
+ {}
+ 
+@@ -88,6 +88,9 @@ uint32_t AluUnit::latency_of(const instr_trace_t* trace) const {
+ 		case MdvType::REM:
+ 		case MdvType::REMU:
+ 			return kMulDivLatency;
++		case MdvType::DOT4:
++		case MdvType::DOT4ACC:
++			return kDot4Latency;
+ 		default:
+ 			std::abort();
+ 		}
+@@ -441,6 +444,20 @@ void AluUnit::execute(instr_trace_t* trace) {
+ 				}
+ 			}
+ 		} break;
++		case MdvType::DOT4:
++		case MdvType::DOT4ACC: {
++			// four signed int8 x int8 products summed in int32 (exact; |sum| <= 4 * 128 * 128). DOT4ACC adds rs3 = rd.
++			for (uint32_t t = thread_start; t < num_threads; ++t) {
++				if (!tmask.test(t)) continue;
++				uint32_t a = rs1_data[t].u32, b = rs2_data[t].u32;
++				int32_t sum = 0;
++				for (int k = 0; k < 4; ++k) {
++					sum += (int32_t)(int8_t)(a >> (8 * k)) * (int32_t)(int8_t)(b >> (8 * k));
++				}
++				if (mdv_type == MdvType::DOT4ACC) sum += (int32_t)rs3_data[t].u32;
++				rd_data[t].i = sext((uint64_t)(uint32_t)sum, 32);
++			}
++		} break;
+ 		case MdvType::MULH: {
+ 			for (uint32_t t = thread_start; t < num_threads; ++t) {
+ 				if (!tmask.test(t)) continue;

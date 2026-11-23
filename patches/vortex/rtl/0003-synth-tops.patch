@@ -1,0 +1,285 @@
+flat-port synthesis wrappers (VX_alu_int_top, VX_dot4_lane_top, VX_l2_top = VX_cache_top with the PhaseShift L2 parameters) under hw/unittest, for the Yosys cost flow only.
+
+diff --git a/hw/unittest/alu_int/VX_alu_int_top.sv b/hw/unittest/alu_int/VX_alu_int_top.sv
+new file mode 100644
+index 000000000..cda12a1b5
+--- /dev/null
++++ b/hw/unittest/alu_int/VX_alu_int_top.sv
+@@ -0,0 +1,50 @@
++// PhaseShift: flat-port synthesis wrapper of one VX_alu_int block (interfaces instantiated inside), so the
++// Yosys flow can measure the integer ALU alone (with / without -DPS_DOT4_ENABLE). Not part of any simulation.
++`include "VX_define.vh"
++
++module VX_alu_int_top import VX_gpu_pkg::*; #(
++    parameter NUM_LANES = `VX_CFG_NUM_ALU_LANES
++) (
++    input  wire         clk,
++    input  wire         reset,
++    input  wire         execute_valid,
++    input  alu_execute_t execute_data,
++    output wire         execute_ready,
++    output wire         result_valid,
++    output alu_result_t result_data,
++    input  wire         result_ready,
++    output wire         br_valid,
++    output wire [NW_WIDTH-1:0] br_wid,
++    output wire         br_taken,
++    output wire [PC_BITS-1:0] br_dest,
++    output wire         br_is_trap,
++    output wire         br_is_mret,
++    output wire [3:0]   br_trap_cause
++);
++    VX_execute_if #(.data_t (alu_execute_t)) execute_if();
++    VX_result_if #(.data_t (alu_result_t)) result_if();
++    VX_branch_ctl_if branch_ctl_if();
++
++    assign execute_if.valid = execute_valid;
++    assign execute_if.data  = execute_data;
++    assign execute_ready    = execute_if.ready;
++    assign result_valid     = result_if.valid;
++    assign result_data      = result_if.data;
++    assign result_if.ready  = result_ready;
++    assign br_valid = branch_ctl_if.valid;
++    assign br_wid = branch_ctl_if.wid;
++    assign br_taken = branch_ctl_if.taken;
++    assign br_dest = branch_ctl_if.dest;
++    assign br_is_trap = branch_ctl_if.is_trap;
++    assign br_is_mret = branch_ctl_if.is_mret;
++    assign br_trap_cause = branch_ctl_if.trap_cause;
++
++    VX_alu_int #(
++        .INSTANCE_ID ("alu_int_top"),
++        .BLOCK_IDX   (0),
++        .NUM_LANES   (NUM_LANES)
++    ) alu_int (
++        .clk (clk), .reset (reset),
++        .execute_if (execute_if), .result_if (result_if), .branch_ctl_if (branch_ctl_if)
++    );
++endmodule
+diff --git a/hw/unittest/dot4_lane/VX_dot4_lane_top.sv b/hw/unittest/dot4_lane/VX_dot4_lane_top.sv
+new file mode 100644
+index 000000000..3c812097d
+--- /dev/null
++++ b/hw/unittest/dot4_lane/VX_dot4_lane_top.sv
+@@ -0,0 +1,15 @@
++// PhaseShift: NUM_LANES x VX_dot4_lane, registered I/O, to measure the dot4 datapath alone (area and the one-stage
++// combinational delay) with the same flow. Not part of any simulation.
++module VX_dot4_lane_top #(parameter NUM_LANES = 32) (
++    input  wire clk,
++    input  wire [NUM_LANES-1:0][31:0] a, b, acc,
++    input  wire use_acc,
++    output reg  [NUM_LANES-1:0][31:0] y
++);
++    reg [NUM_LANES-1:0][31:0] a_r, b_r, acc_r; reg u_r;
++    wire [NUM_LANES-1:0][31:0] y_w;
++    always @(posedge clk) begin a_r <= a; b_r <= b; acc_r <= acc; u_r <= use_acc; y <= y_w; end
++    for (genvar i = 0; i < NUM_LANES; ++i) begin : g
++        VX_dot4_lane l (.a(a_r[i]), .b(b_r[i]), .acc(acc_r[i]), .use_acc(u_r), .y(y_w[i]));
++    end
++endmodule
+diff --git a/hw/unittest/l2_cache/VX_l2_top.sv b/hw/unittest/l2_cache/VX_l2_top.sv
+new file mode 100644
+index 000000000..f125f538d
+--- /dev/null
++++ b/hw/unittest/l2_cache/VX_l2_top.sv
+@@ -0,0 +1,200 @@
++// PhaseShift: VX_cache_top (hw/unittest/cache) with the parameters of the PhaseShift L2 (SimX machine E1-lat190): 256 KiB, 128 B line / 64 B sector,
++// 1 bank, 8 ways, 64 B words (L2_WORD_SIZE = L1_LINE_SIZE), 2 requesters (I$ + D$ mem ports), MSHR_SIZE = VX_CFG_L2_MSHR_SIZE (16 stock, 32 in the prefetch config),
++// write-back LLC, no AMO. Copied by sed from VX_cache_top.sv; used only for the Yosys cost flow.
++// Copyright © 2019-2023
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++`include "VX_cache_define.vh"
++
++module VX_l2_top import VX_gpu_pkg::*; #(
++    parameter `STRING INSTANCE_ID    = "",
++
++    // Number of Word requests per cycle
++    parameter NUM_REQS              = 2,
++
++    // Number of memory ports
++    parameter MEM_PORTS             = 1,
++
++    // Size of cache in bytes (sectored LLC dcache config)
++    parameter CACHE_SIZE            = 262144,
++    // Size of line inside a bank in bytes (128B when sectoring is active)
++    parameter LINE_SIZE             = 128,
++    // Sector = mem-transaction granule (64B => 2 sectors/128B line)
++    parameter SECTOR_SIZE           = 64,
++    // Number of banks
++    parameter NUM_BANKS             = 1,
++    // Number of associative ways
++    parameter NUM_WAYS              = 8,
++    // Size of a word in bytes (dcache request / coalescer-output granule)
++    parameter WORD_SIZE             = 64,
++
++    // Core Response Queue Size
++    parameter CRSQ_SIZE             = 0,
++    // Miss Reserv Queue Knob
++    parameter MSHR_SIZE             = `VX_CFG_L2_MSHR_SIZE,
++    // Memory Response Queue Size
++    parameter MRSQ_SIZE             = 4,
++    parameter MREQ_SIZE             = 0,
++
++    // Enable cache writeable
++    parameter WRITE_ENABLE          = 1,
++
++    // Enable cache writeback (LLC dcache is writeback)
++    parameter WRITEBACK             = 1,
++
++    // Enable dirty bytes on writeback
++    parameter DIRTY_BYTES           = 0,
++
++    // Bank pipeline depth (capacity-scaled)
++    parameter LATENCY               = `VX_CFG_L2_LATENCY,
++
++    // core request tag size
++    parameter TAG_WIDTH             = 16 + UUID_WIDTH,
++
++    // Core response output buffer
++    parameter CORE_OUT_BUF          = 3,
++
++    // Enable AMO support (synth #1 = 0; flip to 1 for the AMO timing run)
++    parameter AMO_ENABLE            = 0,
++
++    // LLC role: 1 exercises the local AMO read-modify-write commit (g_commit),
++    // the path that interacts with the deferred data pipeline.
++    parameter IS_LLC                = 1,
++
++    // Memory request output buffer
++    parameter MEM_OUT_BUF           = 3,
++
++    parameter MEM_TAG_WIDTH         = `CACHE_MEM_TAG_WIDTH(MSHR_SIZE, NUM_BANKS, MEM_PORTS, UUID_WIDTH)
++ ) (
++    input wire clk,
++    input wire reset,
++
++// PERF
++`ifdef PERF_ENABLE
++    output cache_perf_t cache_perf,
++`endif
++
++    // Core request
++    input  wire                     core_req_valid [NUM_REQS],
++    input  wire                     core_req_rw [NUM_REQS],
++    input  wire[WORD_SIZE-1:0]      core_req_byteen [NUM_REQS],
++    input  wire[`CS_WORD_ADDR_WIDTH-1:0] core_req_addr [NUM_REQS],
++    input  wire[MEM_ATTR_WIDTH-1:0] core_req_attr [NUM_REQS],
++    input  wire[`CS_WORD_WIDTH-1:0] core_req_data [NUM_REQS],
++    input  wire[TAG_WIDTH-1:0]      core_req_tag [NUM_REQS],
++    output wire                     core_req_ready [NUM_REQS],
++
++    // Core response
++    output wire                     core_rsp_valid [NUM_REQS],
++    output wire[`CS_WORD_WIDTH-1:0] core_rsp_data [NUM_REQS],
++    output wire[TAG_WIDTH-1:0]      core_rsp_tag [NUM_REQS],
++    input  wire                     core_rsp_ready [NUM_REQS],
++
++    // Memory request (sector-granular; = line when 1 sector/line)
++    output wire                     mem_req_valid [MEM_PORTS],
++    output wire                     mem_req_rw [MEM_PORTS],
++    output wire [SECTOR_SIZE-1:0]   mem_req_byteen [MEM_PORTS],
++    output wire [`CS_MEM_SECTOR_ADDR_WIDTH-1:0] mem_req_addr [MEM_PORTS],
++    output wire [`CS_SECTOR_WIDTH-1:0] mem_req_data [MEM_PORTS],
++    output wire [MEM_TAG_WIDTH-1:0] mem_req_tag [MEM_PORTS],
++    input  wire                     mem_req_ready [MEM_PORTS],
++
++    // Memory response
++    input  wire                     mem_rsp_valid [MEM_PORTS],
++    input  wire [`CS_SECTOR_WIDTH-1:0] mem_rsp_data [MEM_PORTS],
++    input  wire [MEM_TAG_WIDTH-1:0] mem_rsp_tag [MEM_PORTS],
++    output wire                     mem_rsp_ready [MEM_PORTS]
++);
++    VX_mem_bus_if #(
++        .DATA_SIZE (WORD_SIZE),
++        .TAG_WIDTH (TAG_WIDTH)
++    ) core_bus_if[NUM_REQS]();
++
++    VX_mem_bus_if #(
++        .DATA_SIZE (SECTOR_SIZE),
++        .TAG_WIDTH (MEM_TAG_WIDTH)
++    ) mem_bus_if[MEM_PORTS]();
++
++    // Core request
++    for (genvar i = 0; i < NUM_REQS; ++i) begin
++        assign core_bus_if[i].req_valid = core_req_valid[i];
++        assign core_bus_if[i].req_data.rw = core_req_rw[i];
++        assign core_bus_if[i].req_data.byteen = core_req_byteen[i];
++        assign core_bus_if[i].req_data.addr = core_req_addr[i];
++        assign core_bus_if[i].req_data.attr = core_req_attr[i];
++        assign core_bus_if[i].req_data.data = core_req_data[i];
++        assign core_bus_if[i].req_data.tag = core_req_tag[i];
++        assign core_req_ready[i] = core_bus_if[i].req_ready;
++    end
++
++    // Core response
++    for (genvar i = 0; i < NUM_REQS; ++i) begin
++        assign core_rsp_valid[i]= core_bus_if[i].rsp_valid;
++        assign core_rsp_data[i] = core_bus_if[i].rsp_data.data;
++        assign core_rsp_tag[i]  = core_bus_if[i].rsp_data.tag;
++        assign core_bus_if[i].rsp_ready = core_rsp_ready[i];
++    end
++
++    // Memory request
++    for (genvar i = 0; i < MEM_PORTS; ++i) begin
++        assign mem_req_valid[i] = mem_bus_if[i].req_valid;
++        assign mem_req_rw[i]  = mem_bus_if[i].req_data.rw;
++        assign mem_req_byteen[i]= mem_bus_if[i].req_data.byteen;
++        assign mem_req_addr[i] = mem_bus_if[i].req_data.addr;
++        assign mem_req_data[i] = mem_bus_if[i].req_data.data;
++        assign mem_req_tag[i] = mem_bus_if[i].req_data.tag;
++        assign mem_bus_if[i].req_ready = mem_req_ready[i];
++    end
++
++    // Memory response
++    for (genvar i = 0; i < MEM_PORTS; ++i) begin
++        assign mem_bus_if[i].rsp_valid = mem_rsp_valid[i];
++        assign mem_bus_if[i].rsp_data.data = mem_rsp_data[i];
++        assign mem_bus_if[i].rsp_data.tag = mem_rsp_tag[i];
++        assign mem_rsp_ready[i] = mem_bus_if[i].rsp_ready;
++    end
++
++    VX_cache_wrap #(
++        .INSTANCE_ID    (INSTANCE_ID),
++        .CACHE_SIZE     (CACHE_SIZE),
++        .LINE_SIZE      (LINE_SIZE),
++        .SECTOR_SIZE    (SECTOR_SIZE),
++        .NUM_BANKS      (NUM_BANKS),
++        .NUM_WAYS       (NUM_WAYS),
++        .WORD_SIZE      (WORD_SIZE),
++        .NUM_REQS       (NUM_REQS),
++        .MEM_PORTS      (MEM_PORTS),
++        .CRSQ_SIZE      (CRSQ_SIZE),
++        .MSHR_SIZE      (MSHR_SIZE),
++        .MRSQ_SIZE      (MRSQ_SIZE),
++        .MREQ_SIZE      (MREQ_SIZE),
++        .LATENCY        (LATENCY),
++        .TAG_WIDTH      (TAG_WIDTH),
++        .WRITE_ENABLE   (WRITE_ENABLE),
++        .WRITEBACK      (WRITEBACK),
++        .DIRTY_BYTES    (DIRTY_BYTES),
++        .AMO_ENABLE     (AMO_ENABLE),
++        .IS_LLC         (IS_LLC),
++        .CORE_OUT_BUF   (CORE_OUT_BUF),
++        .MEM_OUT_BUF    (MEM_OUT_BUF)
++    ) cache (
++    `ifdef PERF_ENABLE
++        .cache_perf     (cache_perf),
++    `endif
++        .clk            (clk),
++        .reset          (reset),
++        .core_bus_if    (core_bus_if),
++        .mem_bus_if     (mem_bus_if)
++    );
++
++endmodule

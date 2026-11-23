@@ -1,0 +1,72 @@
+diff --git a/sim/avedsim/Makefile b/sim/avedsim/Makefile
+index 863442440..79f48dee0 100644
+--- a/sim/avedsim/Makefile
++++ b/sim/avedsim/Makefile
+@@ -18,8 +18,11 @@ CXXFLAGS += -fPIC
+ CXXFLAGS += -fno-tree-loop-distribute-patterns
+ CXXFLAGS += -I$(SRC_DIR) -I$(XRTSIM_DIR) -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SIM_COMMON_DIR) -I$(SW_COMMON_DIR) -I$(DESTDIR)
+ CXXFLAGS += -I/$(THIRD_PARTY_DIR)/softfloat/source/include
+-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
+-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
++# PhaseShift infra patch 0002 (errata 23; same fix as infra 0001 for sim/simx): Ramulator's FetchContent deps
++# (spdlog v1.11.0 bundles fmt v9, yaml-cpp 0.7.0) are third-party headers; -isystem keeps host GCC >= 13 warnings in
++# them (fmt's -Wdangling-reference false positive under GCC 15) from failing -Werror; Vortex's own code stays -Werror.
++CXXFLAGS += -isystem $(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
++CXXFLAGS += -isystem $(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
+ CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/src
+ CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
+ CXXFLAGS += $(CONFIGS)
+diff --git a/sim/opaesim/Makefile b/sim/opaesim/Makefile
+index 55d1d9d21..fa825bb9d 100644
+--- a/sim/opaesim/Makefile
++++ b/sim/opaesim/Makefile
+@@ -14,8 +14,11 @@ CXXFLAGS += -fPIC
+ CXXFLAGS += -fno-tree-loop-distribute-patterns
+ CXXFLAGS += -I$(SRC_DIR) -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SIM_COMMON_DIR) -I$(SW_COMMON_DIR) -I$(DESTDIR)
+ CXXFLAGS += -I/$(THIRD_PARTY_DIR)/softfloat/source/include
+-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
+-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
++# PhaseShift infra patch 0002 (errata 23; same fix as infra 0001 for sim/simx): Ramulator's FetchContent deps
++# (spdlog v1.11.0 bundles fmt v9, yaml-cpp 0.7.0) are third-party headers; -isystem keeps host GCC >= 13 warnings in
++# them (fmt's -Wdangling-reference false positive under GCC 15) from failing -Werror; Vortex's own code stays -Werror.
++CXXFLAGS += -isystem $(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
++CXXFLAGS += -isystem $(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
+ CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/src
+ CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
+ CXXFLAGS += $(CONFIGS)
+diff --git a/sim/rtlsim/Makefile b/sim/rtlsim/Makefile
+index ed8546474..fba4f332d 100644
+--- a/sim/rtlsim/Makefile
++++ b/sim/rtlsim/Makefile
+@@ -13,8 +13,11 @@ CXXFLAGS += -fPIC
+ CXXFLAGS += -fno-tree-loop-distribute-patterns
+ CXXFLAGS += -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SIM_COMMON_DIR) -I$(SW_COMMON_DIR)
+ CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
+-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
+-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
++# PhaseShift infra patch 0002 (errata 23; same fix as infra 0001 for sim/simx): Ramulator's FetchContent deps
++# (spdlog v1.11.0 bundles fmt v9, yaml-cpp 0.7.0) are third-party headers; -isystem keeps host GCC >= 13 warnings in
++# them (fmt's -Wdangling-reference false positive under GCC 15) from failing -Werror; Vortex's own code stays -Werror.
++CXXFLAGS += -isystem $(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
++CXXFLAGS += -isystem $(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
+ CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/src
+ CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
+ CXXFLAGS += $(CONFIGS)
+diff --git a/sim/xrtsim/Makefile b/sim/xrtsim/Makefile
+index df068a978..99cd65fce 100644
+--- a/sim/xrtsim/Makefile
++++ b/sim/xrtsim/Makefile
+@@ -15,8 +15,11 @@ CXXFLAGS += -fPIC
+ CXXFLAGS += -fno-tree-loop-distribute-patterns
+ CXXFLAGS += -I$(SRC_DIR) -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SIM_COMMON_DIR) -I$(SW_COMMON_DIR) -I$(DESTDIR)
+ CXXFLAGS += -I/$(THIRD_PARTY_DIR)/softfloat/source/include
+-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
+-CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
++# PhaseShift infra patch 0002 (errata 23; same fix as infra 0001 for sim/simx): Ramulator's FetchContent deps
++# (spdlog v1.11.0 bundles fmt v9, yaml-cpp 0.7.0) are third-party headers; -isystem keeps host GCC >= 13 warnings in
++# them (fmt's -Wdangling-reference false positive under GCC 15) from failing -Werror; Vortex's own code stays -Werror.
++CXXFLAGS += -isystem $(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
++CXXFLAGS += -isystem $(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
+ CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/src
+ CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
+ CXXFLAGS += $(CONFIGS)

@@ -1,0 +1,12 @@
+--- a/run.c
++++ b/run.c
+@@ -757,6 +757,9 @@
+             // otherwise sample the next token from the logits
+             next = sample(sampler, logits);
+         }
++        // PhaseShift instrumentation (patches/llama2c/run_tokens.patch): one line per forward step on stderr:
++        // pos, input token, next token, 1 if next was forced from the prompt else 0. Changes no computation.
++        fprintf(stderr, "PS_TOK %d %d %d %d\n", pos, token, next, pos < num_prompt_tokens - 1 ? 1 : 0);
+         pos++;
+ 
+         // data-dependent terminating condition: the BOS (=1) token delimits sequences

@@ -1,0 +1,69 @@
+PhaseShift: RTL of the DP4A-class int8 dot4 datapath inside VX_alu_int (guarded by -DPS_DOT4_ENABLE; default build is bit-identical to stock).
+DOT4/DOT4ACC are selected by ALU_TYPE_OTHER with alu_op[3:2]==2b11 (a slot that fell through to the vote result); decode of custom-3 0x7B is NOT included.
+Applied ONLY to vortex-trees/psrtl (scripts/mk_vortex_tree.sh --patchset base --name psrtl, then git apply). Used only for synthesis cost, never simulated with the SimX trees.
+
+diff --git a/hw/rtl/core/VX_alu_int.sv b/hw/rtl/core/VX_alu_int.sv
+index 3a680055b..6cd925b0f 100644
+--- a/hw/rtl/core/VX_alu_int.sv
++++ b/hw/rtl/core/VX_alu_int.sv
+@@ -133,6 +133,24 @@ module VX_alu_int import VX_gpu_pkg::*; #(
+         assign msc_result_w[i] = `VX_CFG_XLEN'($signed(alu_in1[i][31:0] << alu_in2_imm[i][4:0])); // SLLW
+     end
+ 
++`ifdef PS_DOT4_ENABLE
++    // PhaseShift: DP4A-class int8 dot product, one VX_dot4_lane per lane, selected by ALU_TYPE_OTHER with alu_op[3:2] == 2'b11
++    // (a slot that used to fall through to the vote result); alu_op[0] = 1 -> DOT4ACC (adds rs3, the destination register, already routed
++    // to this unit for WGATHER). Decode (custom-3 0x7B -> this op) is NOT in this patch: a handful of gates, outside the datapath cost.
++    wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] dot4_result;
++    for (genvar i = 0; i < NUM_LANES; ++i) begin : g_dot4
++        wire [31:0] dot4_y;
++        VX_dot4_lane dot4 (
++            .a       (alu_in1[i][31:0]),
++            .b       (alu_in2[i][31:0]),
++            .acc     (execute_if.data.rs3_data[i][31:0]),
++            .use_acc (alu_op[0]),
++            .y       (dot4_y)
++        );
++        assign dot4_result[i] = `VX_CFG_XLEN'($signed(dot4_y));
++    end
++`endif
++
+     // VOTE
+     wire [NUM_LANES-1:0] vote_true, vote_false;
+     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_vote_calc
+@@ -235,6 +253,9 @@ module VX_alu_int import VX_gpu_pkg::*; #(
+                     2'b00: alu_result[i] = vote_result[i];
+                     2'b01: alu_result[i] = shfl_result[i];
+                     2'b10: alu_result[i] = wgather_result[i];
++                `ifdef PS_DOT4_ENABLE
++                    2'b11: alu_result[i] = dot4_result[i];
++                `endif
+                     default: alu_result[i] = vote_result[i];
+                 endcase
+             end else begin
+diff --git a/hw/rtl/core/VX_dot4_lane.sv b/hw/rtl/core/VX_dot4_lane.sv
+new file mode 100644
+index 000000000..0a20dc206
+--- /dev/null
++++ b/hw/rtl/core/VX_dot4_lane.sv
+@@ -0,0 +1,20 @@
++// PhaseShift: one lane of the DP4A-class int8 dot product.
++//   y = sum_{k=0..3} int8(a.byte[k]) * int8(b.byte[k])  (+ acc when use_acc)       exact 32-bit integer arithmetic
++// |sum| <= 4 * 128 * 128 = 65536 fits in 18 signed bits; the optional accumulate adds the third register source.
++// Written behaviourally on purpose (four signed 8x8 `*` and an adder tree): the cost measured by the synthesis flow is
++// the flow's default lowering of `*`/`+`, the same lowering every other multiplier/adder in the core gets (consistent flow).
++
++module VX_dot4_lane (
++    input  wire [31:0] a,
++    input  wire [31:0] b,
++    input  wire [31:0] acc,
++    input  wire        use_acc,
++    output wire [31:0] y
++);
++    wire signed [15:0] p0 = $signed(a[ 7: 0]) * $signed(b[ 7: 0]);
++    wire signed [15:0] p1 = $signed(a[15: 8]) * $signed(b[15: 8]);
++    wire signed [15:0] p2 = $signed(a[23:16]) * $signed(b[23:16]);
++    wire signed [15:0] p3 = $signed(a[31:24]) * $signed(b[31:24]);
++    wire signed [17:0] s  = 18'(p0) + 18'(p1) + 18'(p2) + 18'(p3);
++    assign y = 32'($signed(s)) + (use_acc ? acc : 32'd0);
++endmodule

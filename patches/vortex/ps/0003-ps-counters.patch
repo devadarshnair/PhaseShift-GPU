@@ -1,0 +1,1359 @@
+diff --git a/VX_types.toml b/VX_types.toml
+index 35e47dca5..8a2e59141 100644
+--- a/VX_types.toml
++++ b/VX_types.toml
+@@ -646,7 +646,7 @@ VX_DCR_MPM_CLASS_DCACHE  = 4
+ VX_DCR_MPM_CLASS_L2CACHE = 5
+ VX_DCR_MPM_CLASS_L3CACHE = 6
+ VX_DCR_MPM_CLASS_MEM     = 7
+-VX_DCR_MPM_CLASS_RESERVED2= 8
++VX_DCR_MPM_CLASS_PHASESHIFT = 8  # ps patch ps-counters (was RESERVED2): PhaseShift counters, paged, see [ps_counters]
+ VX_DCR_MPM_CLASS_RESERVED3= 9
+ VX_DCR_MPM_CLASS_RESERVED4= 10
+ VX_DCR_MPM_CLASS_TCU     = 11
+@@ -656,6 +656,37 @@ VX_DCR_MPM_CLASS_OM      = 14
+ VX_DCR_MPM_CLASS_RTU     = 15
+ VX_DCR_MPM_CLASS_DXA     = 16
+ 
++# PhaseShift MPM class 8 (ps patch ps-counters, docs/methodology.md §12.9). The class has more counters
++# than one MPM window (CSR ids 3..31 = 29 counters), so it is PAGED: counter k is read with MPM class
++# (VX_DCR_MPM_CLASS_PHASESHIFT | (page << VX_PS_MPM_PAGE_SHIFT)), page = k / VX_PS_MPM_PAGE_SIZE, at CSR
++# VX_CSR_MPM_USER + k % VX_PS_MPM_PAGE_SIZE (the DCR tag carries 10 class bits; classes 0..16 need 5). Every counter is
++# device-wide (any core returns the same value) and cumulative since device open, except DXA_MAX_INFLIGHT (a maximum).
++# Per-class groups have VX_PS_NUM_CLASSES (8) entries, indexed by VX_PS_CLASS_*; MARKS by VX_PS_MARK_*.
++[ps_counters]
++VX_PS_MPM_PAGE_SHIFT        = 5
++VX_PS_MPM_PAGE_SIZE         = 29
++VX_PS_HIST_BUCKETS          = 16   # log2 buckets of the DRAM read wait: b0 = [0,2), bk = [2^k, 2^(k+1)), b15 = [2^15, inf)
++VX_PS_DXA_STREAMS           = 4    # DXA workers per DxaCore counted separately; workers >= 3 share slot 3
++VX_PS_CNT_L1L2_RD_BYTES     = 0    # [class] bytes of read requests entering the L2 (L1/DXA -> L2 link; one block each)
++VX_PS_CNT_L1L2_WR_BYTES     = 8    # [class] bytes of write requests entering the L2
++VX_PS_CNT_L2_ACCESSES       = 16   # [class] L2 bank accesses (= stock reads + writes)
++VX_PS_CNT_L2_MISSES         = 24   # [class] L2 misses (= stock read_misses + write_misses); hits = accesses - misses
++VX_PS_CNT_L2_FILLS_DEMOTED  = 32   # [class] L2 fills inserted at low priority (mechanism D, 0 in this patch)
++VX_PS_CNT_L2_FILLS_BYPASSED = 40   # [class] L2 fills not allocated (mechanism D, 0 in this patch)
++VX_PS_CNT_DRAM_RD_BYTES     = 48   # [class] DRAM read bytes (DramSim::send_request, one block each)
++VX_PS_CNT_DRAM_WR_BYTES     = 56   # [class] DRAM write bytes
++VX_PS_CNT_DRAM_OCC          = 64   # [class] DRAM occupancy integral: sum over DRAM-model cycles of requests in the model
++VX_PS_CNT_DRAM_BP           = 72   # [class] channel-cycles a request waited at the DRAM model input (model full)
++VX_PS_CNT_DRAM_RD_WAIT      = 80   # [class] sum of read residencies (accept -> response handed back), cycles
++VX_PS_CNT_DRAM_RD_DONE      = 88   # [class] completed reads
++VX_PS_CNT_DRAM_WR_WAIT      = 96   # [class] sum of write residencies, cycles
++VX_PS_CNT_DRAM_WR_DONE      = 104  # [class] completed writes
++VX_PS_CNT_MARKS             = 112  # [mark type] ps_mark work units, cumulative over launches
++VX_PS_CNT_DXA_BYTES         = 120  # [stream] DXA GMEM read bytes per worker slot
++VX_PS_CNT_DXA_MAX_INFLIGHT  = 124  # [stream] max GMEM reads in flight per worker (MAX, not a sum)
++VX_PS_CNT_DRAM_RD_HIST      = 128  # [class][bucket] DRAM read-wait histogram, index 128 + class * 16 + bucket
++VX_PS_CNT_NUM               = 256
++
+ [csr_mpm_base]
+ VX_CSR_MCYCLE = 0xB00
+ VX_CSR_MCYCLE_H = 0xB80
+diff --git a/sim/common/dram_sim.cpp b/sim/common/dram_sim.cpp
+index 404e535ab..584f6f850 100644
+--- a/sim/common/dram_sim.cpp
++++ b/sim/common/dram_sim.cpp
+@@ -388,9 +388,17 @@ DramSim::~DramSim() {
+ 
+ void DramSim::reset() {
+   impl_->reset();
++  // PhaseShift (patch ps-counters): Impl::reset() drops every queued transaction; requests still in flight are no
++  // longer tracked (their PsTrack is released if a late completion arrives, but not counted).
++  ++ps_epoch_;
++  for (auto& n : ps_inflight_) n = 0;
+ }
+ 
+ void DramSim::tick() {
++  // PhaseShift (patch ps-counters): occupancy sample at the start of the tick (see PsStats). Observation only.
++  ++ps_cycle_;
++  for (uint32_t c = 0; c < kPsClasses; ++c)
++    ps_stats_.occ[c] += ps_inflight_[c];
+   impl_->tick();
+ }
+ 
+@@ -398,10 +406,63 @@ bool DramSim::can_accept(uint32_t channel) const {
+   return impl_->can_accept(channel);
+ }
+ 
++// PhaseShift (patch ps-counters): the tracking record handed to Impl as the callback argument.
++struct DramSim::PsTrack {
++  DramSim*         owner;
++  ResponseCallback callback;   // the caller's callback and argument, forwarded unchanged
++  void*            arg;
++  uint64_t         sent;       // owner->ps_cycle_ at send_request
++  uint64_t         epoch;
++  uint32_t         cls;
++  bool             is_write;
++};
++
++static uint32_t ps_log2_bucket(uint64_t w) {   // = ps_wait_bucket() in sim/simx/ps_counters.h
++  uint32_t b = 0;
++  while (w > 1 && b < DramSim::kPsHistBuckets - 1) {
++    w >>= 1;
++    ++b;
++  }
++  return b;
++}
++
++bool DramSim::ps_on_response(void* a) {
++  auto t = static_cast<PsTrack*>(a);
++  if (!t->callback(t->arg))
++    return false;   // the caller stalled: same behaviour as without tracking (Impl retries next tick)
++  DramSim* d = t->owner;
++  if (t->epoch == d->ps_epoch_) {
++    const uint64_t w = d->ps_cycle_ - t->sent;
++    const uint32_t c = t->cls;
++    --d->ps_inflight_[c];
++    if (t->is_write) {
++      d->ps_stats_.wr_wait[c] += w;
++      ++d->ps_stats_.wr_done[c];
++    } else {
++      d->ps_stats_.rd_wait[c] += w;
++      ++d->ps_stats_.rd_done[c];
++      ++d->ps_stats_.rd_hist[c][ps_log2_bucket(w)];
++    }
++  }
++  delete t;
++  return true;
++}
++
+ void DramSim::send_request(uint32_t channel, uint64_t addr, bool is_write, ResponseCallback callback, void* arg,
+                            uint32_t mem_class) {
+   // PhaseShift (patch mem-class): count the class; the request itself is timed exactly as before.
+   static_assert(kPsClasses == VX_PS_NUM_CLASSES, "DramSim class table must match VX_PS_NUM_CLASSES");
+-  ++(is_write ? ps_wr_reqs_ : ps_rd_reqs_)[mem_class & (kPsClasses - 1)];
+-  impl_->send_request(channel, addr, is_write, callback, arg);
++  static_assert(kPsHistBuckets == VX_PS_HIST_BUCKETS, "DramSim histogram must match VX_PS_HIST_BUCKETS");
++  const uint32_t cls = mem_class & (kPsClasses - 1);
++  ++(is_write ? ps_wr_reqs_ : ps_rd_reqs_)[cls];
++  if (callback == nullptr) {
++    impl_->send_request(channel, addr, is_write, callback, arg);
++    return;
++  }
++  // PhaseShift (patch ps-counters): track the residency through a forwarding callback (see PsStats). Impl calls
++  // ps_on_response exactly where it would have called `callback`, and ps_on_response returns what `callback` returns,
++  // so the transaction timing and the stall/retry behaviour are unchanged.
++  auto t = new PsTrack{this, callback, arg, ps_cycle_, ps_epoch_, cls, is_write};
++  ++ps_inflight_[cls];
++  impl_->send_request(channel, addr, is_write, &DramSim::ps_on_response, t);
+ }
+diff --git a/sim/common/dram_sim.h b/sim/common/dram_sim.h
+index 434653c08..eb178d57a 100644
+--- a/sim/common/dram_sim.h
++++ b/sim/common/dram_sim.h
+@@ -24,6 +24,10 @@ class DramSim {
+ public:
+   typedef bool (*ResponseCallback)(void *arg);
+ 
++  // PhaseShift: class-table sizes (= VX_PS_NUM_CLASSES, VX_PS_HIST_BUCKETS; static_asserts in dram_sim.cpp).
++  static constexpr uint32_t kPsClasses = 8;        // patch mem-class (3-bit class field)
++  static constexpr uint32_t kPsHistBuckets = 16;   // patch ps-counters (log2 read-wait buckets)
++
+   // The JEDEC standards Ramulator models, each at its own organization and
+   // timing; the data rate picks the speed.
+   enum class Type {
+@@ -72,13 +76,39 @@ public:
+   void set_phase_config(const PhaseConfig& cfg) { phase_cfg_ = cfg; }
+   const PhaseConfig& phase_config() const { return phase_cfg_; }
+ 
++  // PhaseShift (patch ps-counters, docs/methodology.md §12.9): per-class residency in the DRAM model, cumulative since
++  // construction (reset() leaves them alone). A request is IN the model from send_request (accepted into its
++  // channel's queue) until its response callback returns true (a read: its data was handed back to the memory
++  // crossbar; a write: all its transactions were accepted by Ramulator) -- the interval that DramSim's own
++  // can_accept()/queue_size accounting uses. occ[c] adds, at the START of every tick(), the class-c requests in the
++  // model, so a request resident for k ticks adds exactly k (Little's law: sum occ = sum wait once nothing is in
++  // flight); rd_wait/wr_wait = summed residencies (ticks) of completed requests, rd_done/wr_done their number,
++  // rd_hist = log2 histogram of read residencies (bucket 0 = [0,2), k = [2^k, 2^(k+1)), last bucket open). Only
++  // observed, never read by the timing model. A request sent without a callback is counted in ps_class_reqs only.
++  struct PsStats {
++    uint64_t occ[kPsClasses] = {};
++    uint64_t rd_wait[kPsClasses] = {};
++    uint64_t rd_done[kPsClasses] = {};
++    uint64_t wr_wait[kPsClasses] = {};
++    uint64_t wr_done[kPsClasses] = {};
++    uint64_t rd_hist[kPsClasses][kPsHistBuckets] = {};
++  };
++  const PsStats& ps_stats() const { return ps_stats_; }
++
+ private:
+-  static constexpr uint32_t kPsClasses = 8;   // = VX_PS_NUM_CLASSES (3-bit class field)
+   class Impl;
+   Impl* impl_;
+   PhaseConfig phase_cfg_;
+   uint64_t ps_rd_reqs_[kPsClasses] = {};
+   uint64_t ps_wr_reqs_[kPsClasses] = {};
++  // PhaseShift (patch ps-counters): residency tracking (see PsStats). Each tracked request carries a PsTrack as the
++  // callback argument; ps_on_response forwards to the caller's callback unchanged and records the completion.
++  struct PsTrack;
++  static bool ps_on_response(void* arg);
++  PsStats  ps_stats_;
++  uint64_t ps_inflight_[kPsClasses] = {};
++  uint64_t ps_cycle_ = 0;   // DramSim ticks since construction
++  uint64_t ps_epoch_ = 0;   // bumped by reset(): requests dropped by a reset are not counted when they complete
+ };
+ 
+ }
+diff --git a/sim/simx/cluster.cpp b/sim/simx/cluster.cpp
+index 3238a4abd..ded6f0737 100644
+--- a/sim/simx/cluster.cpp
++++ b/sim/simx/cluster.cpp
+@@ -85,6 +85,8 @@ public:
+       VX_CFG_L2_REPL_POLICY,         // replacement policy
+       (VX_CFG_L2_ENABLED != 0) && (VX_CFG_L3_ENABLED == 0), // is_llc
+     });
++    // PhaseShift (patch ps-counters): count the L1/DXA -> L2 link traffic per class (also when the L2 is bypassed)
++    l2cache_->ps_count_link_inputs();
+ 
+ 
+     // connect l2cache memory interface
+@@ -483,6 +485,11 @@ public:
+       socket->ps_collect(out);
+   }
+ 
++  void ps_restart_max_windows() {
++    for (auto& socket : sockets_)
++      socket->ps_restart_max_windows();
++  }
++
+   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+     for (auto& socket : sockets_) {
+       int ret = socket->dcr_read(addr, tag, value);
+@@ -676,6 +683,10 @@ void Cluster::ps_collect(PsClassCollect& out) const {
+   impl_->ps_collect(out);
+ }
+ 
++void Cluster::ps_restart_max_windows() {
++  impl_->ps_restart_max_windows();
++}
++
+ int Cluster::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+   return impl_->dcr_read(addr, tag, value);
+ }
+diff --git a/sim/simx/cluster.h b/sim/simx/cluster.h
+index 0c8cdc0bc..b33551b29 100644
+--- a/sim/simx/cluster.h
++++ b/sim/simx/cluster.h
+@@ -118,6 +118,9 @@ public:
+   // PhaseShift (patch mem-class): add the L2's and every socket's class counters to `out`.
+   void ps_collect(PsClassCollect& out) const;
+ 
++  // PhaseShift (patch ps-counters): restart every socket's DXA max-in-flight window (interval trace).
++  void ps_restart_max_windows();
++
+   class Core* get_core(uint32_t idx) const;
+ 
+   // Cache flush walk. ProcessorImpl ticks in level order (L1 in parallel
+diff --git a/sim/simx/core.cpp b/sim/simx/core.cpp
+index 4609ad635..54325196a 100644
+--- a/sim/simx/core.cpp
++++ b/sim/simx/core.cpp
+@@ -1251,6 +1251,10 @@ const Core::PerfStats& Core::perf_stats() const {
+   return impl_->perf_stats();
+ }
+ 
++uint64_t Core::ps_instrs() const {   // PhaseShift (patch ps-counters)
++  return impl_->perf_stats().instrs;
++}
++
+ int Core::get_exitcode() const {
+   return impl_->get_exitcode();
+ }
+diff --git a/sim/simx/core.h b/sim/simx/core.h
+index 4af725f5f..c9eddc3de 100644
+--- a/sim/simx/core.h
++++ b/sim/simx/core.h
+@@ -205,15 +205,25 @@ public:
+ 
+   int get_exitcode() const;
+ 
+-  // PhaseShift (patch mem-class): per-core work-unit counters written through VX_CSR_PS_MARK (one count per CSR
+-  // write instruction of a warp; type = value & 7, VX_PS_MARK_*). Per launch: cleared by on_reset().
+-  void     ps_mark(uint32_t type) { ++ps_marks_.at(type & (VX_PS_NUM_MARK_TYPES - 1)); }
++  // PhaseShift (patch mem-class; counting rule corrected by patch ps-counters, errata 33b): per-core work-unit counters
++  // written through VX_CSR_PS_MARK, type = value & 7 (VX_PS_MARK_*). CsrUnit::process runs once per SFU-packet trace
++  // of a warp instruction and calls ps_mark only for the instruction's FIRST trace (trace->sop), so each warp
++  // CSR-write instruction counts exactly once, whatever NUM_SFU_LANES and the active lanes are. ps_marks_ are per
++  // launch (cleared by on_reset()); ps_marks_cum_ accumulate since construction (MPM class 8, patch ps-counters).
++  void     ps_mark(uint32_t type) {
++    const uint32_t t = type & (VX_PS_NUM_MARK_TYPES - 1);
++    ++ps_marks_.at(t);
++    ++ps_marks_cum_.at(t);
++  }
+   uint64_t ps_mark_count(uint32_t type) const { return ps_marks_.at(type & (VX_PS_NUM_MARK_TYPES - 1)); }
++  uint64_t ps_mark_count_cum(uint32_t type) const { return ps_marks_cum_.at(type & (VX_PS_NUM_MARK_TYPES - 1)); }
+   uint64_t ps_mark_total() const {
+     uint64_t n = 0;
+     for (auto c : ps_marks_) n += c;
+     return n;
+   }
++  // PhaseShift (patch ps-counters): retired instructions since construction (= perf_stats().instrs; trace unit).
++  uint64_t ps_instrs() const;
+ 
+ protected:
+   void on_reset();
+@@ -228,6 +238,7 @@ private:
+   uint32_t core_id_;
+   Socket*  socket_;
+   std::array<uint64_t, VX_PS_NUM_MARK_TYPES> ps_marks_ = {};   // PhaseShift (patch mem-class)
++  std::array<uint64_t, VX_PS_NUM_MARK_TYPES> ps_marks_cum_ = {};   // PhaseShift (patch ps-counters)
+ 
+   class Impl;
+   Impl* impl_;
+diff --git a/sim/simx/csr_unit.cpp b/sim/simx/csr_unit.cpp
+index 741957081..fb726bfab 100644
+--- a/sim/simx/csr_unit.cpp
++++ b/sim/simx/csr_unit.cpp
+@@ -134,6 +134,25 @@ Word CsrUnit::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
+       // user-defined MPM CSRs
+       auto proc_perf = core_->socket()->cluster()->processor()->perf_stats();
+       auto perf_class = core_->mpm_class();
++      // PhaseShift (patch ps-counters): MPM class 8 = PHASESHIFT, paged (VX_types.toml [ps_counters]): the class
++      // field carries the page above VX_PS_MPM_PAGE_SHIFT; CSR id 3 + i of page p is counter p * PAGE_SIZE + i.
++      // Device-wide values (every core returns the same), computed by ProcessorImpl::ps_counter.
++      if ((perf_class & ((1u << VX_PS_MPM_PAGE_SHIFT) - 1)) == VX_DCR_MPM_CLASS_PHASESHIFT) {
++        const bool hi = (addr >= VX_CSR_MPM_BASE_H);
++        const uint32_t id = addr - (hi ? VX_CSR_MPM_BASE_H : VX_CSR_MPM_BASE);
++        const uint32_t first = VX_CSR_MPM_USER - VX_CSR_MPM_BASE;
++        if (id < first)
++          return 0;
++        const uint32_t k = (perf_class >> VX_PS_MPM_PAGE_SHIFT) * VX_PS_MPM_PAGE_SIZE + (id - first);
++        if (k >= VX_PS_CNT_NUM)
++          return 0;
++        const uint64_t v = core_->socket()->cluster()->processor()->ps_counter(k);
++      #ifdef VX_CFG_XLEN_64
++        return hi ? 0 : v;
++      #else
++        return hi ? Word(v >> 32) : Word(v & 0xffffffffu);
++      #endif
++      }
+       switch (perf_class) {
+       case VX_DCR_MPM_CLASS_BASE:
+         break;
+@@ -356,7 +375,10 @@ void CsrUnit::set_csr(uint32_t addr, Word value, uint32_t wid, uint32_t tid) {
+     break;
+   // PhaseShift (patch mem-class). mem_hint: the class (low 3 bits) tagged onto this warp's later loads/stores
+   // (LsuUnit); 0 = unset (address ranges decide, methodology §12). ps_mark: one work unit of type value & 7 on this
+-  // core; process() calls this once per CSR instruction (not once per SFU packet), so a warp counts one unit.
++  // core. (Comment corrected by patch ps-counters, errata 33b:) process() runs once per SFU-packet TRACE -- with
++  // NUM_SFU_LANES < NUM_THREADS the SFU dispatcher splits a warp instruction into one trace per packet that has an
++  // active lane -- and calls this for ps_mark only on the instruction's first trace (trace->sop), so a warp
++  // instruction counts exactly one unit.
+   case VX_CSR_PS_MEM_HINT:
+     warp.ps_mem_hint = uint32_t(value) & (VX_PS_NUM_CLASSES - 1);
+     break;
+@@ -432,8 +454,11 @@ void CsrUnit::process(instr_trace_t* trace) {
+   // The warp is processed one SFU-width packet at a time: a packet's active
+   // lanes read the CSR, then its first active lane supplies the write.
+   constexpr uint32_t kPacketLanes = VX_CFG_NUM_SFU_LANES;
+-  // PhaseShift (patch mem-class): a ps_mark write counts one unit per warp instruction, so only the first packet
+-  // with an active lane performs the write (every packet still returns the read value).
++  // PhaseShift (patch mem-class; corrected by patch ps-counters, errata 33b): a ps_mark write counts one unit per warp
++  // instruction. The SFU dispatcher has already split the instruction into one trace per SFU packet with an active
++  // lane (dispatcher.cpp, sop only on the first emitted trace) and this function runs once per trace, so a guard
++  // local to one call cannot de-duplicate across packets: only the instruction's first trace (trace->sop) performs
++  // the write; every trace still returns the read value. ps_mark_written additionally keeps a trace to one write.
+   bool ps_mark_written = false;
+   for (uint32_t base = 0; base < num_threads; base += kPacketLanes) {
+     uint32_t first = num_threads;
+@@ -457,7 +482,7 @@ void CsrUnit::process(instr_trace_t* trace) {
+       // the written value is the unit type (src_v), not a read-modify-write of the counter; CSRRS/CSRRC with a
+       // zero source do not write (RISC-V semantics), as below
+       bool writes = (csr_type == CsrType::CSRRW) || (src_v != 0);
+-      if (writes && !ps_mark_written) {
++      if (writes && trace->sop && !ps_mark_written) {
+         this->set_csr(csr_addr, src_v, wid, first);
+         ps_mark_written = true;
+       }
+diff --git a/sim/simx/dxa/dxa_core.cpp b/sim/simx/dxa/dxa_core.cpp
+index 5ebe16c77..548a24831 100644
+--- a/sim/simx/dxa/dxa_core.cpp
++++ b/sim/simx/dxa/dxa_core.cpp
+@@ -218,6 +218,8 @@ public:
+         uint32_t slot_id = uint32_t(rsp.tag) & (VX_CFG_DXA_MAX_INFLIGHT - 1);
+         auto& w = workers_[worker_id];
+         if (slot_id < w.inflight.size() && w.inflight[slot_id].allocated) {
++          if (!w.inflight[slot_id].rsp_arrived)
++            simobject_->ps_dxa_response(worker_id);   // PhaseShift (patch ps-counters): a real GMEM read returned
+           w.inflight[slot_id].rsp_arrived = true;
+           w.inflight[slot_id].rsp_data    = rsp.data;
+         }
+@@ -588,6 +590,7 @@ private:
+     auto& ch = gmem_arb_->ReqIn.at(w.worker_id);
+     if (!ch.try_send(mreq)) return; // arb backpressure
+     simobject_->ps_count_gmem(mreq.flags.mem_class);
++    simobject_->ps_dxa_issue(w.worker_id);   // PhaseShift (patch ps-counters)
+ 
+     w.inflight[slot].allocated   = true;
+     w.inflight[slot].rsp_arrived = false;
+@@ -875,7 +878,24 @@ DxaCore::~DxaCore() {
+   delete impl_;
+ }
+ 
+-void DxaCore::on_reset() { impl_->reset(); }
++void DxaCore::on_reset() {
++  impl_->reset();
++  // PhaseShift (patch ps-counters): the reset drops every in-flight slot; bytes and maxima are cumulative.
++  for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s) ps_dxa_inflight_[s] = 0;
++}
++
++void DxaCore::ps_dxa_issue(uint32_t worker) {
++  const uint32_t s = std::min<uint32_t>(worker, VX_PS_DXA_STREAMS - 1);
++  ps_dxa_bytes_[s] += kGmemLineSize;
++  const uint64_t n = ++ps_dxa_inflight_[s];
++  ps_dxa_max_tot_[s] = std::max(ps_dxa_max_tot_[s], n);
++  ps_dxa_max_win_[s] = std::max(ps_dxa_max_win_[s], n);
++}
++
++void DxaCore::ps_dxa_response(uint32_t worker) {
++  const uint32_t s = std::min<uint32_t>(worker, VX_PS_DXA_STREAMS - 1);
++  if (ps_dxa_inflight_[s] != 0) --ps_dxa_inflight_[s];
++}
+ void DxaCore::on_tick()  { impl_->tick(); }
+ 
+ int DxaCore::dcr_write(uint32_t addr, uint32_t value) {
+diff --git a/sim/simx/dxa/dxa_core.h b/sim/simx/dxa/dxa_core.h
+index 7fe0184d5..881017aed 100644
+--- a/sim/simx/dxa/dxa_core.h
++++ b/sim/simx/dxa/dxa_core.h
+@@ -92,6 +92,21 @@ public:
+   void ps_count_gmem(uint32_t cls) { ++ps_gmem_reqs_[cls & (VX_PS_NUM_CLASSES - 1)]; }
+   uint64_t ps_gmem_reqs(uint32_t cls) const { return ps_gmem_reqs_[cls & (VX_PS_NUM_CLASSES - 1)]; }
+ 
++  // PhaseShift (patch ps-counters, docs/methodology.md §12.9): per DXA "stream" = worker slot
++  // s = min(worker_id, VX_PS_DXA_STREAMS - 1) (workers >= 3 share the last slot): GMEM read bytes issued (one L1 line
++  // each, cumulative since construction) and GMEM reads in flight (issued, response not yet arrived). The maximum of
++  // the in-flight count is kept twice: since construction (MPM class 8) and since the last restart_max_window() (the
++  // interval trace restarts it at every row; a restart starts the window at the current level). Observation only.
++  void ps_dxa_issue(uint32_t worker);
++  void ps_dxa_response(uint32_t worker);
++  uint64_t ps_dxa_bytes(uint32_t s) const { return ps_dxa_bytes_[s]; }
++  uint64_t ps_dxa_max_inflight(uint32_t s, bool window) const {
++    return window ? ps_dxa_max_win_[s] : ps_dxa_max_tot_[s];
++  }
++  void ps_restart_max_window() {
++    for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s) ps_dxa_max_win_[s] = ps_dxa_inflight_[s];
++  }
++
+ protected:
+   void on_reset();
+   void on_tick();
+@@ -101,6 +116,10 @@ private:
+   Impl* impl_;
+   PhaseConfig phase_cfg_;
+   uint64_t ps_gmem_reqs_[VX_PS_NUM_CLASSES] = {};
++  uint64_t ps_dxa_bytes_[VX_PS_DXA_STREAMS] = {};      // PhaseShift (patch ps-counters)
++  uint64_t ps_dxa_inflight_[VX_PS_DXA_STREAMS] = {};
++  uint64_t ps_dxa_max_tot_[VX_PS_DXA_STREAMS] = {};
++  uint64_t ps_dxa_max_win_[VX_PS_DXA_STREAMS] = {};
+ 
+   friend class SimObject<DxaCore>;
+ };
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+index 57c19c441..737d3d8fb 100644
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -1006,6 +1006,7 @@ private:
+               ++perf_stats_.reads;
+               ++perf_stats_.read_misses;
+             }
++            ++mshr_.ps_stats_.misses[coalesced.flags.mem_class];   // PhaseShift (patch ps-counters)
+             this->core_req_in.pop();
+             return;
+           }
+@@ -1706,6 +1707,7 @@ private:
+         }
+         if (bank_req.write) ++perf_stats_.write_misses;
+         else                ++perf_stats_.read_misses;
++        ++mshr_.ps_stats_.misses[bank_req.flags.mem_class];   // PhaseShift (patch ps-counters)
+       }
+ 
+       if (config_.repl_policy == Cache::PLRU)
+@@ -2065,7 +2067,20 @@ void Cache::on_tick() {
+ }
+ 
+ Cache::PsClassStats Cache::ps_class_stats() const {
+-  return impl_->ps_class_stats();
++  Cache::PsClassStats st = impl_->ps_class_stats();
++  for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) {   // PhaseShift (patch ps-counters): input-link counters
++    st.link_rd[c] = ps_link_rd_[c];
++    st.link_wr[c] = ps_link_wr_[c];
++  }
++  return st;
++}
++
++void Cache::ps_count_link_inputs() {
++  for (auto& ch : core_req_in) {
++    ch.tx_callback([this](const MemReq& req, uint64_t /*cycle*/) {
++      ++(req.is_write() ? ps_link_wr_ : ps_link_rd_)[req.flags.mem_class];
++    });
++  }
+ }
+ 
+ Cache::PerfStats Cache::perf_stats() const {
+diff --git a/sim/simx/mem/cache.h b/sim/simx/mem/cache.h
+index 2e01e4918..701338c76 100644
+--- a/sim/simx/mem/cache.h
++++ b/sim/simx/mem/cache.h
+@@ -74,14 +74,33 @@ public:
+ 	//   reqs[c]        core-side requests admitted by the cache's banks, by class (after range classification)
+ 	//   mixed_merges   requests that joined an MSHR chain whose first requester has a different class
+ 	//   prio_upgrades  of those, joins that raised the chain priority (methodology §12 merge rule)
++	// PhaseShift (patch ps-counters, docs/methodology.md §12.9) adds, same rules:
++	//   misses[c]      bank misses by class, counted exactly where the stock read_misses / write_misses are (so
++	//                  sum_c reqs = reads + writes and sum_c misses = read_misses + write_misses)
++	//   link_rd/wr[c]  requests (one memory block each) delivered INTO the cache's core-side input ports, by class as
++	//                  they arrive (before this cache's range classification); counted for bypassed caches too, and
++	//                  only where ps_count_link_inputs() was called (the L2s: the L1/DXA -> L2 link)
++	//   fill_demoted/bypassed[c]  fills inserted at low priority / not allocated (mechanism D); this patch
++	//                  never increments them
+ 	struct PsClassStats {
+ 		uint64_t reqs[VX_PS_NUM_CLASSES] = {};
+ 		uint64_t mixed_merges = 0;
+ 		uint64_t prio_upgrades = 0;
++		uint64_t misses[VX_PS_NUM_CLASSES] = {};
++		uint64_t link_rd[VX_PS_NUM_CLASSES] = {};
++		uint64_t link_wr[VX_PS_NUM_CLASSES] = {};
++		uint64_t fill_demoted[VX_PS_NUM_CLASSES] = {};
++		uint64_t fill_bypassed[VX_PS_NUM_CLASSES] = {};
+ 
+ 		PsClassStats& operator+=(const PsClassStats& rhs) {
+-			for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c)
++			for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) {
+ 				this->reqs[c] += rhs.reqs[c];
++				this->misses[c] += rhs.misses[c];
++				this->link_rd[c] += rhs.link_rd[c];
++				this->link_wr[c] += rhs.link_wr[c];
++				this->fill_demoted[c] += rhs.fill_demoted[c];
++				this->fill_bypassed[c] += rhs.fill_bypassed[c];
++			}
+ 			this->mixed_merges += rhs.mixed_merges;
+ 			this->prio_upgrades += rhs.prio_upgrades;
+ 			return *this;
+@@ -101,6 +120,11 @@ public:
+ 	// PhaseShift (patch mem-class): see PsClassStats.
+ 	PsClassStats ps_class_stats() const;
+ 
++	// PhaseShift (patch ps-counters): count the requests delivered into core_req_in (PsClassStats::link_rd/wr) with a
++	// delivery callback on each input channel (fires on delivery, also through a bypassed cache's forwarded
++	// channels). Call once after construction, before any channel is used; observation only.
++	void ps_count_link_inputs();
++
+ 	// Flush API: arm a write-back walk that emits dirty lines via mem_req_out.
+ 	// flush_done() returns true once the walk completes; the caller is expected
+ 	// to tick the simulator until then. Write-through caches no-op.
+@@ -120,6 +144,8 @@ private:
+ 	class Impl;
+ 	Impl* impl_;
+ 	PhaseConfig phase_cfg_;
++	uint64_t ps_link_rd_[VX_PS_NUM_CLASSES] = {};   // PhaseShift (patch ps-counters), see ps_count_link_inputs()
++	uint64_t ps_link_wr_[VX_PS_NUM_CLASSES] = {};
+ 
+ 	friend class SimObject<Cache>;
+ };
+diff --git a/sim/simx/mem/memory.cpp b/sim/simx/mem/memory.cpp
+index 7333f1497..d8e0c57df 100644
+--- a/sim/simx/mem/memory.cpp
++++ b/sim/simx/mem/memory.cpp
+@@ -47,6 +47,8 @@ private:
+ 	// PhaseShift (patch mem-class): DRAM bytes per ([dcr_phase] accounting region, class), cumulative since
+ 	// construction; region = PhaseConfig::region_of(request address) with the config latched at send time.
+ 	uint64_t ps_region_bytes_[PhaseConfig::NUM_REGIONS][VX_PS_NUM_CLASSES] = {};
++	// PhaseShift (patch ps-counters): channel-cycles a head request waited because the DRAM model was full, by class.
++	uint64_t ps_bp_[VX_PS_NUM_CLASSES] = {};
+ 	struct DramCallbackArgs {
+ 		Memory::Impl* memsim;
+ 		MemReq request;
+@@ -91,8 +93,14 @@ public:
+ 		uint32_t num_banks = config_.dram.num_channels;
+ 		uint32_t lg2_block_size = log2ceil(config_.dram.block_size);
+ 		for (uint32_t i = 0; i < num_banks; ++i) {
+-			if (mem_xbar_->ReqOut.at(i).empty() || !dram_sim_.can_accept(i))
++			if (mem_xbar_->ReqOut.at(i).empty())
+ 				continue;
++			if (!dram_sim_.can_accept(i)) {
++				// PhaseShift (patch ps-counters): a request of this class waits at the DRAM model input this cycle
++				// (channel queue full); counted per channel-cycle, observation only.
++				++ps_bp_[mem_xbar_->ReqOut.at(i).peek().flags.mem_class];
++				continue;
++			}
+ 
+ 			auto& mem_req = mem_xbar_->ReqOut.at(i).peek();
+ 
+@@ -177,6 +185,7 @@ public:
+ 
+ 	uint64_t ps_region_bytes(uint32_t region, uint32_t cls) const { return ps_region_bytes_[region][cls]; }
+ 	uint32_t block_size() const { return config_.dram.block_size; }
++	uint64_t ps_dram_bp(uint32_t cls) const { return ps_bp_[cls & (VX_PS_NUM_CLASSES - 1)]; }
+ };
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -230,4 +239,12 @@ uint64_t Memory::ps_region_bytes(uint32_t region, uint32_t cls) const {
+ 
+ uint32_t Memory::block_size() const {
+ 	return impl_->block_size();
+-}
+\ No newline at end of file
++}
++
++const DramSim::PsStats& Memory::ps_dram_stats() const {
++	return impl_->dram_sim().ps_stats();
++}
++
++uint64_t Memory::ps_dram_bp(uint32_t cls) const {
++	return impl_->ps_dram_bp(cls);
++}
+diff --git a/sim/simx/mem/memory.h b/sim/simx/mem/memory.h
+index 2d21e502f..4b78663bb 100644
+--- a/sim/simx/mem/memory.h
++++ b/sim/simx/mem/memory.h
+@@ -69,6 +69,11 @@ public:
+ 	uint64_t ps_region_bytes(uint32_t region, uint32_t cls) const;
+ 	uint32_t block_size() const;
+ 
++	// PhaseShift (patch ps-counters): DRAM-model residency per class (DramSim::PsStats) and input back-pressure
++	// channel-cycles per class; cumulative since construction (docs/methodology.md §12.9).
++	const DramSim::PsStats& ps_dram_stats() const;
++	uint64_t ps_dram_bp(uint32_t cls) const;
++
+ protected:
+ 	void on_reset();
+ 	void on_tick();
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index 9d0a31ebb..4d492fcdf 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -210,11 +210,21 @@ ProcessorImpl::ProcessorImpl()
+     }
+   }
+ 
++  // PhaseShift (patch ps-counters): PS_TRACE=<file> [PS_TRACE_UNIT=marks|instrs] [PS_TRACE_EVERY=<n>] writes the
++  // work-unit interval trace (methodology §12.10); the cores list feeds its work counter.
++  ps_trace_.reset(PsTrace::create_from_env());
++  for (auto& cluster : clusters_) {
++    for (uint32_t i = 0; cluster->get_core(i) != nullptr; ++i)
++      ps_cores_.push_back(cluster->get_core(i));
++  }
++
+   // reset the device
+   this->reset();
+ }
+ 
+ ProcessorImpl::~ProcessorImpl() {
++  this->ps_trace_end_launch();   // PhaseShift (patch ps-counters): a cycle()-driven last launch
++  ps_trace_.reset();
+   SimPlatform::instance().finalize();
+ }
+ 
+@@ -269,7 +279,7 @@ void ProcessorImpl::flush_caches() {
+     }
+     if (all_done && SimPlatform::instance().idle())
+       break;
+-    SimPlatform::instance().tick();
++    this->ps_tick();   // PhaseShift (patch ps-counters)
+   }
+ 
+   // L2 caches.
+@@ -283,13 +293,13 @@ void ProcessorImpl::flush_caches() {
+     }
+     if (all_done && SimPlatform::instance().idle())
+       break;
+-    SimPlatform::instance().tick();
++    this->ps_tick();   // PhaseShift (patch ps-counters)
+   }
+ 
+   // L3 cache (single instance at processor level).
+   l3cache_->flush_begin();
+   while (!l3cache_->flush_done() || !SimPlatform::instance().idle()) {
+-    SimPlatform::instance().tick();
++    this->ps_tick();   // PhaseShift (patch ps-counters)
+   }
+ }
+ 
+@@ -302,8 +312,9 @@ int ProcessorImpl::run() {
+   bool done;
+   int exitcode = 0;
+   do {
+-    SimPlatform::instance().tick();
++    this->ps_tick();   // PhaseShift (patch ps-counters): = SimPlatform tick + tick count
+     this->phase_after_tick();
++    this->ps_trace_after_tick();   // PhaseShift (patch ps-counters): PS_TRACE (observation only)
+     bool any_running = false;
+     for (auto cluster : clusters_) {
+       if (cluster->running()) {
+@@ -332,6 +343,7 @@ int ProcessorImpl::run() {
+     perf_mem_latency_ += perf_mem_pending_reads_;
+   } while (!done);
+ 
++  this->ps_trace_end_launch();   // PhaseShift (patch ps-counters): closes the launch's last interval row
+   if (ps_debug_class_)
+     this->ps_class_report("end");
+   return exitcode;
+@@ -429,8 +441,9 @@ bool ProcessorImpl::cycle() {
+     this->phase_begin_launch();
+     is_cycle_initialized_ = true;
+   }
+-  SimPlatform::instance().tick();
++  this->ps_tick();   // PhaseShift (patch ps-counters)
+   this->phase_after_tick();
++  this->ps_trace_after_tick();
+   perf_mem_latency_ += perf_mem_pending_reads_;
+   return this->any_running();
+ }
+@@ -438,6 +451,109 @@ bool ProcessorImpl::cycle() {
+ void ProcessorImpl::phase_begin_launch() {
+   ++phase_launches_;
+   phase_dump_pending_ = phase_dump_;
++  // PhaseShift (patch ps-counters): start the launch's interval rows (a launch begun through cycle() and never ended
++  // by run() is closed here first)
++  if (ps_trace_) {
++    this->ps_trace_end_launch();
++    ps_launch_instrs0_ = this->ps_instrs_total();
++    PsCounters snap;
++    this->ps_snapshot(snap, true);
++    ps_trace_->begin_launch(phase_launches_ - 1, snap);
++  }
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// PhaseShift (patch ps-counters, docs/methodology.md §12.9-§12.10): MPM class-8 table and the
++// work-unit interval trace. Everything below only reads simulator state.
++
++void ProcessorImpl::ps_snapshot(PsCounters& v, bool window) const {
++  v.fill(0);
++  PsClassCollect col;
++  col.dxa_window = window;
++  for (auto& cluster : clusters_)
++    cluster->ps_collect(col);
++  // one request on the L1/DXA -> L2 link carries one L1 line (the L2's input word, cluster.cpp)
++  const uint64_t link_blk = VX_CFG_L1_LINE_SIZE;
++  const DramSim::PsStats& d = memsim_->ps_dram_stats();
++  for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) {
++    v[VX_PS_CNT_L1L2_RD_BYTES + c]     = col.l2.link_rd[c] * link_blk;
++    v[VX_PS_CNT_L1L2_WR_BYTES + c]     = col.l2.link_wr[c] * link_blk;
++    v[VX_PS_CNT_L2_ACCESSES + c]       = col.l2.reqs[c];
++    v[VX_PS_CNT_L2_MISSES + c]         = col.l2.misses[c];
++    v[VX_PS_CNT_L2_FILLS_DEMOTED + c]  = col.l2.fill_demoted[c];
++    v[VX_PS_CNT_L2_FILLS_BYPASSED + c] = col.l2.fill_bypassed[c];
++    v[VX_PS_CNT_DRAM_RD_BYTES + c]     = memsim_->ps_class_bytes(c, false);
++    v[VX_PS_CNT_DRAM_WR_BYTES + c]     = memsim_->ps_class_bytes(c, true);
++    v[VX_PS_CNT_DRAM_OCC + c]          = d.occ[c];
++    v[VX_PS_CNT_DRAM_BP + c]           = memsim_->ps_dram_bp(c);
++    v[VX_PS_CNT_DRAM_RD_WAIT + c]      = d.rd_wait[c];
++    v[VX_PS_CNT_DRAM_RD_DONE + c]      = d.rd_done[c];
++    v[VX_PS_CNT_DRAM_WR_WAIT + c]      = d.wr_wait[c];
++    v[VX_PS_CNT_DRAM_WR_DONE + c]      = d.wr_done[c];
++    for (uint32_t b = 0; b < VX_PS_HIST_BUCKETS; ++b)
++      v[VX_PS_CNT_DRAM_RD_HIST + c * VX_PS_HIST_BUCKETS + b] = d.rd_hist[c][b];
++  }
++  for (uint32_t t = 0; t < VX_PS_NUM_MARK_TYPES; ++t)
++    v[VX_PS_CNT_MARKS + t] = col.marks_cum[t];
++  for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s) {
++    v[VX_PS_CNT_DXA_BYTES + s]        = col.dxa_bytes[s];
++    v[VX_PS_CNT_DXA_MAX_INFLIGHT + s] = col.dxa_max_inflight[s];
++  }
++}
++
++uint64_t ProcessorImpl::ps_counter(uint32_t k) const {
++  if (k >= VX_PS_CNT_NUM)
++    return 0;
++  PsCounters v;
++  this->ps_snapshot(v, false);
++  return v[k];
++}
++
++uint64_t ProcessorImpl::ps_instrs_total() const {
++  uint64_t n = 0;
++  for (auto core : ps_cores_)
++    n += core->ps_instrs();
++  return n;
++}
++
++uint64_t ProcessorImpl::ps_work() const {
++  if (ps_trace_->unit() == PsTrace::INSTRS)
++    return this->ps_instrs_total() - ps_launch_instrs0_;
++  uint64_t n = 0;
++  for (auto core : ps_cores_)
++    n += core->ps_mark_total();
++  return n;
++}
++
++void ProcessorImpl::ps_restart_max_windows() {
++  for (auto& cluster : clusters_)
++    cluster->ps_restart_max_windows();
++}
++
++void ProcessorImpl::ps_trace_cross() {
++  PsCounters snap;
++  this->ps_snapshot(snap, true);
++  ps_trace_->cross(this->ps_work(), SimPlatform::instance().cycles(), ps_ticks_, this->ps_instrs_total(), snap);
++  this->ps_restart_max_windows();
++}
++
++void ProcessorImpl::ps_trace_end_launch() {
++  if (!ps_trace_ || !ps_trace_->in_launch())
++    return;
++  PsCounters snap;
++  this->ps_snapshot(snap, true);
++  ps_trace_->end_launch(this->ps_work(), SimPlatform::instance().cycles(), ps_ticks_, this->ps_instrs_total(), snap);
++  this->ps_restart_max_windows();
++}
++
++void ProcessorImpl::ps_trace_flush() {
++  if (!ps_trace_)
++    return;
++  this->ps_trace_end_launch();   // a cycle()-driven launch is closed before its flush
++  PsCounters snap;
++  this->ps_snapshot(snap, true);
++  ps_trace_->flush(SimPlatform::instance().cycles(), ps_ticks_, this->ps_instrs_total(), snap);
++  this->ps_restart_max_windows();
+ }
+ 
+ void ProcessorImpl::dump_phase_config() const {
+@@ -504,6 +620,7 @@ int ProcessorImpl::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+     // After flush_caches() returns every dirty line has reached memsim_'s
+     // backing RAM.
+     this->flush_caches();
++    this->ps_trace_flush();   // PhaseShift (patch ps-counters): one "flush" row (write-backs, flush cycles)
+     if (ps_debug_class_)
+       this->ps_class_report("flush");   // PhaseShift (patch mem-class): includes the flush write-backs
+     *value = 0;
+diff --git a/sim/simx/processor_impl.h b/sim/simx/processor_impl.h
+index 3fdfa70ac..167ea57fd 100644
+--- a/sim/simx/processor_impl.h
++++ b/sim/simx/processor_impl.h
+@@ -18,9 +18,14 @@
+ #include "constants.h"
+ #include "cluster.h"
+ #include "kmu.h"
++#include "ps_counters.h"   // PhaseShift (patch ps-counters)
++#include <memory>
++#include <vector>
+ 
+ namespace vortex {
+ 
++class Core;
++
+ class ProcessorImpl {
+ public:
+   struct PerfStats {
+@@ -74,6 +79,12 @@ public:
+   // each level's evictions reach the next before that level itself flushes.
+   void flush_caches();
+ 
++  // PhaseShift (patch ps-counters, docs/methodology.md §12.9): the MPM class-8 counter table (VX_types.toml
++  // [ps_counters]), device-wide, cumulative since construction. window = read the DXA max-in-flight windows of the
++  // interval trace instead of the since-construction maxima. ps_counter(k) serves the paged MPM CSR reads.
++  void ps_snapshot(PsCounters& out, bool window) const;
++  uint64_t ps_counter(uint32_t k) const;
++
+ private:
+ 
+   // A grid-less launch is a delegated draw launch: the KMU walks no CTAs and
+@@ -96,6 +107,23 @@ private:
+   // PhaseShift (patch mem-class): PS_DEBUG_CLASS report (when = "end" of a launch or "flush").
+   void ps_class_report(const char* when) const;
+ 
++  // PhaseShift (patch ps-counters): one simulated cycle (= SimPlatform tick + the cumulative tick count the trace
++  // uses), and the work-unit interval trace hooks (PS_TRACE; methodology §12.10). Observation only.
++  void ps_tick() {
++    SimPlatform::instance().tick();
++    ++ps_ticks_;
++  }
++  uint64_t ps_work() const;          // per-launch work counter in the trace unit
++  uint64_t ps_instrs_total() const;  // retired instructions since construction, summed over cores
++  void ps_trace_after_tick() {
++    if (ps_trace_ && ps_trace_->due(this->ps_work()))
++      this->ps_trace_cross();
++  }
++  void ps_trace_cross();
++  void ps_trace_end_launch();
++  void ps_trace_flush();
++  void ps_restart_max_windows();
++
+   Kmu::Ptr    kmu_;
+   std::vector<Cluster::Ptr> clusters_;
+   Memory::Ptr memsim_;
+@@ -123,6 +151,11 @@ private:
+   bool        phase_dump_ = false;
+   bool        phase_dump_pending_ = false;
+   bool        ps_debug_class_ = false;   // PhaseShift (patch mem-class): PS_DEBUG_CLASS (read once at construction)
++  // PhaseShift (patch ps-counters)
++  std::unique_ptr<PsTrace> ps_trace_;      // PS_TRACE (read once at construction); null = no trace
++  std::vector<Core*>       ps_cores_;      // every core, for the trace's work counter
++  uint64_t                 ps_ticks_ = 0;  // simulated cycles since construction (launches and flushes)
++  uint64_t                 ps_launch_instrs0_ = 0;   // ps_instrs_total() at the start of the current launch
+ };
+ 
+ }
+diff --git a/sim/simx/ps_counters.h b/sim/simx/ps_counters.h
+new file mode 100644
+index 000000000..37bc84014
+--- /dev/null
++++ b/sim/simx/ps_counters.h
+@@ -0,0 +1,287 @@
++// Copyright © 2019-2023
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// PhaseShift (ps patch ps-counters, rules in docs/methodology.md §12.9-§12.10).
++//
++// (1) The PhaseShift MPM class 8 counter table: VX_PS_CNT_NUM 64-bit counters whose layout (group bases) is defined
++//     once in VX_types.toml [ps_counters], so SimX (values, trace header) and sw/runtime/common/perf.cpp (names,
++//     printing) agree. ProcessorImpl::ps_snapshot() fills a PsCounters from the device; csr_unit.cpp serves it to the
++//     paged MPM CSR reads.
++// (2) PsTrace: the work-unit interval trace (env PS_TRACE=<file>, PS_TRACE_UNIT=marks|instrs, PS_TRACE_EVERY=<n>).
++//     It only READS simulator state (snapshots) after a tick; nothing it does feeds back into the timing model.
++#pragma once
++
++#include <VX_types.h>
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iostream>
++#include <string>
++
++namespace vortex {
++
++static_assert(VX_PS_CNT_DRAM_RD_HIST + VX_PS_NUM_CLASSES * VX_PS_HIST_BUCKETS == VX_PS_CNT_NUM,
++              "[ps_counters] layout: the histogram must be the last group");
++static_assert(VX_PS_CNT_DXA_MAX_INFLIGHT + VX_PS_DXA_STREAMS == VX_PS_CNT_DRAM_RD_HIST, "[ps_counters] layout");
++static_assert(VX_PS_CNT_MARKS + VX_PS_NUM_MARK_TYPES == VX_PS_CNT_DXA_BYTES, "[ps_counters] layout");
++static_assert(VX_DCR_MPM_CLASS_PHASESHIFT < (1u << VX_PS_MPM_PAGE_SHIFT), "MPM class must fit below the page bits");
++static_assert(((VX_PS_CNT_NUM + VX_PS_MPM_PAGE_SIZE - 1) / VX_PS_MPM_PAGE_SIZE) <= (1u << (10 - VX_PS_MPM_PAGE_SHIFT)),
++              "the DCR tag carries 10 MPM class bits: too many pages");
++
++using PsCounters = std::array<uint64_t, VX_PS_CNT_NUM>;
++
++// Short names, shared with perf.cpp (which spells the same tables out; tests/test_pstrace.py compares the two).
++inline const char* ps_class_short(uint32_t c) {
++  static const char* const n[VX_PS_NUM_CLASSES] = {"ord", "wgt", "kvp", "kvs", "dxa", "c5", "c6", "c7"};
++  return n[c & (VX_PS_NUM_CLASSES - 1)];
++}
++inline const char* ps_mark_short(uint32_t t) {
++  static const char* const n[VX_PS_NUM_MARK_TYPES] = {"other", "prefill", "decode", "m3", "m4", "m5", "m6", "m7"};
++  return n[t & (VX_PS_NUM_MARK_TYPES - 1)];
++}
++
++// true for the counters that are maxima (interval value = max within the interval, total = max over the run).
++inline bool ps_counter_is_max(uint32_t k) {
++  return k >= VX_PS_CNT_DXA_MAX_INFLIGHT && k < VX_PS_CNT_DXA_MAX_INFLIGHT + VX_PS_DXA_STREAMS;
++}
++
++inline std::string ps_counter_name(uint32_t k) {
++  struct G { uint32_t base; const char* name; };
++  static const G per_class[] = {
++    {VX_PS_CNT_L1L2_RD_BYTES, "l1l2_rd_bytes"}, {VX_PS_CNT_L1L2_WR_BYTES, "l1l2_wr_bytes"},
++    {VX_PS_CNT_L2_ACCESSES, "l2_acc"}, {VX_PS_CNT_L2_MISSES, "l2_miss"},
++    {VX_PS_CNT_L2_FILLS_DEMOTED, "l2_fill_demoted"}, {VX_PS_CNT_L2_FILLS_BYPASSED, "l2_fill_bypassed"},
++    {VX_PS_CNT_DRAM_RD_BYTES, "dram_rd_bytes"}, {VX_PS_CNT_DRAM_WR_BYTES, "dram_wr_bytes"},
++    {VX_PS_CNT_DRAM_OCC, "dram_occ"}, {VX_PS_CNT_DRAM_BP, "dram_bp"},
++    {VX_PS_CNT_DRAM_RD_WAIT, "dram_rd_wait"}, {VX_PS_CNT_DRAM_RD_DONE, "dram_rd_done"},
++    {VX_PS_CNT_DRAM_WR_WAIT, "dram_wr_wait"}, {VX_PS_CNT_DRAM_WR_DONE, "dram_wr_done"}};
++  for (const auto& g : per_class) {
++    if (k >= g.base && k < g.base + VX_PS_NUM_CLASSES)
++      return std::string(g.name) + "_" + ps_class_short(k - g.base);
++  }
++  if (k >= VX_PS_CNT_MARKS && k < VX_PS_CNT_MARKS + VX_PS_NUM_MARK_TYPES)
++    return std::string("marks_") + ps_mark_short(k - VX_PS_CNT_MARKS);
++  if (k >= VX_PS_CNT_DXA_BYTES && k < VX_PS_CNT_DXA_BYTES + VX_PS_DXA_STREAMS)
++    return "dxa_bytes_s" + std::to_string(k - VX_PS_CNT_DXA_BYTES);
++  if (ps_counter_is_max(k))
++    return "dxa_max_inflight_s" + std::to_string(k - VX_PS_CNT_DXA_MAX_INFLIGHT);
++  if (k >= VX_PS_CNT_DRAM_RD_HIST && k < VX_PS_CNT_NUM) {
++    uint32_t i = k - VX_PS_CNT_DRAM_RD_HIST;
++    return std::string("dram_rd_hist_") + ps_class_short(i / VX_PS_HIST_BUCKETS) + "_b"
++         + std::to_string(i % VX_PS_HIST_BUCKETS);
++  }
++  return "rsvd" + std::to_string(k);
++}
++
++// log2 bucket of a wait in cycles (see VX_PS_HIST_BUCKETS): 0 and 1 -> 0, [2^k, 2^(k+1)) -> k, capped.
++inline uint32_t ps_wait_bucket(uint64_t w) {
++  uint32_t b = 0;
++  while (w > 1 && b < VX_PS_HIST_BUCKETS - 1) {
++    w >>= 1;
++    ++b;
++  }
++  return b;
++}
++
++// Work-unit interval trace (methodology §12.10). The simulator calls:
++//   begin_launch(launch, snap)                   after the launch's reset
++//   due(work) / cross(work, cycle, ticks, instrs, snap)   after every simulated cycle of the launch
++//   end_launch(work, cycle, ticks, instrs, snap)  when the launch is done (before the trailing flush)
++//   flush(cycle, ticks, instrs, snap)             after every cache flush (write-backs, flush ticks)
++// `work` = the per-launch work counter in the trace unit (ps_mark total, or instructions retired since the launch
++// began, summed over cores); `ticks` = cumulative simulated cycles since device open; `instrs` = cumulative retired
++// instructions summed over cores. Row k (1-based) of a launch closes when work first reaches k*n; the LAST row of a
++// launch closes at the end of the launch instead (it also holds the tail after the last unit), so a launch with
++// W > 0 units has exactly ceil(W / n) work rows. Every row holds the counter DELTAS since the previous row (maxima:
++// the maximum within the row), so the sum of all rows of the file equals the end-of-run totals exactly.
++class PsTrace {
++public:
++  enum Unit { MARKS = 0, INSTRS = 1 };
++
++  // Returns nullptr unless PS_TRACE is set; aborts on a bad PS_TRACE_UNIT / PS_TRACE_EVERY.
++  static PsTrace* create_from_env() {
++    const char* path = std::getenv("PS_TRACE");
++    if (path == nullptr || path[0] == '\0')
++      return nullptr;
++    Unit unit = MARKS;
++    if (const char* u = std::getenv("PS_TRACE_UNIT")) {
++      if (std::strcmp(u, "marks") == 0) unit = MARKS;
++      else if (std::strcmp(u, "instrs") == 0) unit = INSTRS;
++      else if (u[0] != '\0') {
++        std::cerr << "Error: PS_TRACE_UNIT must be marks or instrs (got '" << u << "')" << std::endl;
++        std::abort();
++      }
++    }
++    uint64_t every = 1;
++    if (const char* e = std::getenv("PS_TRACE_EVERY")) {
++      char* end = nullptr;
++      unsigned long long v = std::strtoull(e, &end, 10);
++      if (e[0] == '\0' || end == nullptr || *end != '\0' || v == 0) {
++        std::cerr << "Error: PS_TRACE_EVERY must be a positive integer (got '" << e << "')" << std::endl;
++        std::abort();
++      }
++      every = v;
++    }
++    return new PsTrace(path, unit, every);
++  }
++
++  ~PsTrace() { out_.flush(); }
++
++  Unit unit() const { return unit_; }
++
++  void begin_launch(uint64_t launch, const PsCounters& snap) {
++    launch_ = launch;
++    interval_ = 0;
++    next_ = every_;
++    pending_valid_ = false;
++    in_launch_ = true;
++    (void)snap;   // the baseline is the previous row's snapshot (continuous, so nothing is lost between rows)
++  }
++
++  // Per-cycle check (cheap): true when `work` has reached the next boundary. The simulator then takes a snapshot and
++  // calls cross(); several boundaries crossed in one cycle give one row each (the first holds the deltas, the rest
++  // are empty rows closed at the same cycle).
++  bool due(uint64_t work) const { return in_launch_ && work >= next_; }
++  bool in_launch() const { return in_launch_; }
++
++  void cross(uint64_t work, uint64_t cycle, uint64_t ticks, uint64_t instrs, const PsCounters& snap) {
++    while (work >= next_) {
++      Row r = this->close(snap, ticks, instrs);
++      r.kind = "work";
++      r.interval = ++interval_;
++      r.work_end = next_;
++      r.work_at = work;
++      r.cycle = cycle;
++      if (pending_valid_)
++        this->write(pending_);
++      pending_ = r;
++      pending_valid_ = true;
++      next_ += every_;
++    }
++  }
++
++  void end_launch(uint64_t work, uint64_t cycle, uint64_t ticks, uint64_t instrs, const PsCounters& snap) {
++    if (!in_launch_)
++      return;
++    in_launch_ = false;
++    Row tail = this->close(snap, ticks, instrs);
++    if (pending_valid_ && work == pending_.work_end) {
++      // no unit after the last boundary: the tail (epilogue cycles, drain) belongs to the last row
++      this->fold(pending_, tail);
++      pending_.cycle = cycle;
++      this->write(pending_);
++    } else {
++      if (pending_valid_)
++        this->write(pending_);
++      tail.kind = "work";
++      tail.interval = ++interval_;
++      tail.work_end = work;   // partial last interval (or the whole launch when it has fewer than n units)
++      tail.work_at = work;
++      tail.cycle = cycle;
++      this->write(tail);
++    }
++    pending_valid_ = false;
++    last_work_ = work;
++    out_.flush();
++  }
++
++  void flush(uint64_t cycle, uint64_t ticks, uint64_t instrs, const PsCounters& snap) {
++    Row r = this->close(snap, ticks, instrs);
++    r.kind = "flush";
++    r.interval = 0;
++    r.work_end = last_work_;
++    r.work_at = last_work_;
++    r.cycle = cycle;
++    this->write(r);
++    out_.flush();
++  }
++
++private:
++  struct Row {
++    const char* kind = "work";
++    uint64_t interval = 0;
++    uint64_t work_end = 0;
++    uint64_t work_at = 0;
++    uint64_t cycle = 0;
++    uint64_t cycles = 0;
++    uint64_t instrs = 0;
++    PsCounters v{};
++  };
++
++  PsTrace(const char* path, Unit unit, uint64_t every)
++    : out_(path, std::ios::out | std::ios::trunc), unit_(unit), every_(every) {
++    if (!out_) {
++      std::cerr << "Error: cannot open PS_TRACE file " << path << std::endl;
++      std::abort();
++    }
++    base_.fill(0);
++    // header: fixed columns, then every class-8 counter by name (VX_PS_CNT_* order)
++    out_ << "launch,row,kind,interval,unit,every,work_end,work_at,cycle,cycles,instrs";
++    for (uint32_t k = 0; k < VX_PS_CNT_NUM; ++k)
++      out_ << "," << ps_counter_name(k);
++    out_ << "\n";
++  }
++
++  // Row with the deltas since the previous close; advances the baseline. Maxima are taken as is: the simulator
++  // restarts every max window right after each close (ProcessorImpl::ps_trace_closed), so a row's maximum is the
++  // maximum within the row.
++  Row close(const PsCounters& snap, uint64_t ticks, uint64_t instrs) {
++    Row r;
++    for (uint32_t k = 0; k < VX_PS_CNT_NUM; ++k)
++      r.v[k] = ps_counter_is_max(k) ? snap[k] : snap[k] - base_[k];
++    r.cycles = ticks - base_ticks_;
++    r.instrs = instrs - base_instrs_;
++    base_ = snap;
++    base_ticks_ = ticks;
++    base_instrs_ = instrs;
++    return r;
++  }
++
++  static void fold(Row& into, const Row& tail) {
++    for (uint32_t k = 0; k < VX_PS_CNT_NUM; ++k)
++      into.v[k] = ps_counter_is_max(k) ? std::max(into.v[k], tail.v[k]) : into.v[k] + tail.v[k];
++    into.cycles += tail.cycles;
++    into.instrs += tail.instrs;
++  }
++
++  void write(const Row& r) {
++    out_ << launch_ << "," << row_++ << "," << r.kind << "," << r.interval << ","
++         << (unit_ == MARKS ? "marks" : "instrs") << "," << every_ << "," << r.work_end << "," << r.work_at << ","
++         << r.cycle << "," << r.cycles << "," << r.instrs;
++    for (uint32_t k = 0; k < VX_PS_CNT_NUM; ++k)
++      out_ << "," << r.v[k];
++    out_ << "\n";
++  }
++
++private:
++  std::ofstream out_;
++  Unit     unit_;
++  uint64_t every_;
++  uint64_t launch_ = 0;
++  uint64_t row_ = 0;
++  uint64_t interval_ = 0;
++  uint64_t next_ = 0;
++  uint64_t last_work_ = 0;
++  bool     in_launch_ = false;
++  bool     pending_valid_ = false;
++  Row      pending_;
++  PsCounters base_{};
++  uint64_t base_ticks_ = 0;
++  uint64_t base_instrs_ = 0;
++};
++
++}  // namespace vortex
+diff --git a/sim/simx/socket.cpp b/sim/simx/socket.cpp
+index c4969254d..163a2fd5d 100644
+--- a/sim/simx/socket.cpp
++++ b/sim/simx/socket.cpp
+@@ -17,6 +17,7 @@
+ #include "cluster.h"
+ #include "constants.h"
+ #include "types.h"
++#include <algorithm>   // PhaseShift (patch ps-counters): std::max
+ #ifdef VX_CFG_EXT_DXA_ENABLE
+ #include "dxa_core.h"
+ #include "local_mem.h"
+@@ -427,15 +428,27 @@ public:
+ #ifdef VX_CFG_EXT_DXA_ENABLE
+     for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c)
+       out.dxa_gmem[c] += dxa_core_->ps_gmem_reqs(c);
++    for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s) {   // PhaseShift (patch ps-counters)
++      out.dxa_bytes[s] += dxa_core_->ps_dxa_bytes(s);
++      out.dxa_max_inflight[s] = std::max(out.dxa_max_inflight[s], dxa_core_->ps_dxa_max_inflight(s, out.dxa_window));
++    }
+ #endif
+     for (auto& core : cores_) {
+       std::array<uint64_t, VX_PS_NUM_MARK_TYPES> m{};
+-      for (uint32_t t = 0; t < VX_PS_NUM_MARK_TYPES; ++t)
++      for (uint32_t t = 0; t < VX_PS_NUM_MARK_TYPES; ++t) {
+         m[t] = core->ps_mark_count(t);
++        out.marks_cum[t] += core->ps_mark_count_cum(t);   // PhaseShift (patch ps-counters)
++      }
+       out.marks.emplace_back(core->id(), m);
+     }
+   }
+ 
++  void ps_restart_max_windows() {   // PhaseShift (patch ps-counters)
++#ifdef VX_CFG_EXT_DXA_ENABLE
++    dxa_core_->ps_restart_max_window();
++#endif
++  }
++
+   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+     for (auto& core : cores_) {
+       uint16_t core_id = tag & 0xfffff;
+@@ -546,6 +559,10 @@ void Socket::ps_collect(PsClassCollect& out) const {
+   impl_->ps_collect(out);
+ }
+ 
++void Socket::ps_restart_max_windows() {
++  impl_->ps_restart_max_windows();
++}
++
+ Core::Ptr& Socket::core(uint32_t idx) {
+   return impl_->core(idx);
+ }
+diff --git a/sim/simx/socket.h b/sim/simx/socket.h
+index a2627ed79..2dd3b6e11 100644
+--- a/sim/simx/socket.h
++++ b/sim/simx/socket.h
+@@ -36,6 +36,12 @@ struct PsClassCollect {
+   Cache::PsClassStats l1i, l1d, l2;
+   uint64_t dxa_gmem[VX_PS_NUM_CLASSES] = {};
+   std::vector<std::pair<uint32_t, std::array<uint64_t, VX_PS_NUM_MARK_TYPES>>> marks;   // (core id, counts)
++  // PhaseShift (patch ps-counters): marks cumulative over launches (summed over cores); DXA per stream slot: bytes
++  // summed over sockets, max in flight = max over sockets (window or since construction, see ps_collect's flag).
++  uint64_t marks_cum[VX_PS_NUM_MARK_TYPES] = {};
++  uint64_t dxa_bytes[VX_PS_DXA_STREAMS] = {};
++  uint64_t dxa_max_inflight[VX_PS_DXA_STREAMS] = {};
++  bool     dxa_window = false;   // input: read the max-in-flight windows instead of the since-construction maxima
+ };
+ 
+ class Socket : public SimObject<Socket> {
+@@ -86,6 +92,9 @@ public:
+   // PhaseShift (patch mem-class): add this socket's class counters and ps_mark counts to `out`.
+   void ps_collect(PsClassCollect& out) const;
+ 
++  // PhaseShift (patch ps-counters): restart the DXA max-in-flight windows (interval trace).
++  void ps_restart_max_windows();
++
+   std::shared_ptr<Core>& core(uint32_t idx);
+ 
+   // Forwarded cache flush (write-back eviction walk). The walk is a no-op
+diff --git a/sw/runtime/common/perf.cpp b/sw/runtime/common/perf.cpp
+index 8489a3a59..f7ae98550 100644
+--- a/sw/runtime/common/perf.cpp
++++ b/sw/runtime/common/perf.cpp
+@@ -303,6 +303,52 @@ extern "C" vx_result_t vx_device_mpm_query(vx_device_h dev, uint32_t mpm_class,
+   return read_one(core_id, out_value);
+ }
+ 
++// PhaseShift (ps patch ps-counters): names of the MPM class-8 counters, the same table SimX writes into
++// the PS_TRACE header (sim/simx/ps_counters.h ps_counter_name; tests/test_pstrace.py checks that they agree). Layout
++// from VX_types.toml [ps_counters]; class 8 is paged (page p = counters p*VX_PS_MPM_PAGE_SIZE ..).
++static std::string ps_counter_name(uint32_t k) {
++  static const char* const cls[VX_PS_NUM_CLASSES] = {"ord", "wgt", "kvp", "kvs", "dxa", "c5", "c6", "c7"};
++  static const char* const mark[VX_PS_NUM_MARK_TYPES] = {"other", "prefill", "decode", "m3", "m4", "m5", "m6", "m7"};
++  static const struct { uint32_t base; const char* name; } per_class[] = {
++    {VX_PS_CNT_L1L2_RD_BYTES, "l1l2_rd_bytes"}, {VX_PS_CNT_L1L2_WR_BYTES, "l1l2_wr_bytes"},
++    {VX_PS_CNT_L2_ACCESSES, "l2_acc"}, {VX_PS_CNT_L2_MISSES, "l2_miss"},
++    {VX_PS_CNT_L2_FILLS_DEMOTED, "l2_fill_demoted"}, {VX_PS_CNT_L2_FILLS_BYPASSED, "l2_fill_bypassed"},
++    {VX_PS_CNT_DRAM_RD_BYTES, "dram_rd_bytes"}, {VX_PS_CNT_DRAM_WR_BYTES, "dram_wr_bytes"},
++    {VX_PS_CNT_DRAM_OCC, "dram_occ"}, {VX_PS_CNT_DRAM_BP, "dram_bp"},
++    {VX_PS_CNT_DRAM_RD_WAIT, "dram_rd_wait"}, {VX_PS_CNT_DRAM_RD_DONE, "dram_rd_done"},
++    {VX_PS_CNT_DRAM_WR_WAIT, "dram_wr_wait"}, {VX_PS_CNT_DRAM_WR_DONE, "dram_wr_done"}};
++  for (const auto& g : per_class) {
++    if (k >= g.base && k < g.base + VX_PS_NUM_CLASSES)
++      return std::string(g.name) + "_" + cls[k - g.base];
++  }
++  if (k >= VX_PS_CNT_MARKS && k < VX_PS_CNT_MARKS + VX_PS_NUM_MARK_TYPES)
++    return std::string("marks_") + mark[k - VX_PS_CNT_MARKS];
++  if (k >= VX_PS_CNT_DXA_BYTES && k < VX_PS_CNT_DXA_BYTES + VX_PS_DXA_STREAMS)
++    return "dxa_bytes_s" + std::to_string(k - VX_PS_CNT_DXA_BYTES);
++  if (k >= VX_PS_CNT_DXA_MAX_INFLIGHT && k < VX_PS_CNT_DXA_MAX_INFLIGHT + VX_PS_DXA_STREAMS)
++    return "dxa_max_inflight_s" + std::to_string(k - VX_PS_CNT_DXA_MAX_INFLIGHT);
++  if (k >= VX_PS_CNT_DRAM_RD_HIST && k < VX_PS_CNT_NUM) {
++    uint32_t i = k - VX_PS_CNT_DRAM_RD_HIST;
++    return std::string("dram_rd_hist_") + cls[i / VX_PS_HIST_BUCKETS] + "_b" + std::to_string(i % VX_PS_HIST_BUCKETS);
++  }
++  return "rsvd" + std::to_string(k);
++}
++
++// Output line of counter k: per-class groups and the mark / DXA groups one line each, the histogram one line per class.
++static uint32_t ps_counter_line(uint32_t k) {
++  if (k < VX_PS_CNT_MARKS) return k / VX_PS_NUM_CLASSES;
++  if (k < VX_PS_CNT_DXA_BYTES) return 100;
++  if (k < VX_PS_CNT_DXA_MAX_INFLIGHT) return 101;
++  if (k < VX_PS_CNT_DRAM_RD_HIST) return 102;
++  return 200 + (k - VX_PS_CNT_DRAM_RD_HIST) / VX_PS_HIST_BUCKETS;
++}
++
++static vx_result_t ps_query_counter(vx_device_h hdevice, uint32_t k, uint64_t* value) {
++  const uint32_t page = k / VX_PS_MPM_PAGE_SIZE;
++  const uint32_t mpm_class = VX_DCR_MPM_CLASS_PHASESHIFT | (page << VX_PS_MPM_PAGE_SHIFT);
++  return vx_device_mpm_query(hdevice, mpm_class, VX_CSR_MPM_USER + (k % VX_PS_MPM_PAGE_SIZE), 0, value);
++}
++
+ extern "C" vx_result_t vx_device_dump_perf(vx_device_h hdevice, FILE *stream) {
+   if (nullptr == stream)
+     stream = stdout;
+@@ -877,6 +923,42 @@ extern "C" vx_result_t vx_device_dump_perf(vx_device_h hdevice, FILE *stream) {
+     print_rtu_counters(stream, -1, tot, max_cycles, num_sockets);
+   } break;
+ 
++  case VX_DCR_MPM_CLASS_PHASESHIFT: {
++    // PhaseShift (ps patch ps-counters): every class-8 counter (device-wide, cumulative since device open; the
++    // dxa_max_inflight_* entries are maxima) as `PERF: ps: name=value, ...`, one line per counter group, then a
++    // derived line (mean DRAM read residency and L2 hit rate per class with traffic). Parsed by scripts/pstrace.py.
++    std::vector<uint64_t> v(VX_PS_CNT_NUM, 0);
++    for (uint32_t k = 0; k < VX_PS_CNT_NUM; ++k) {
++      CHECK_ERR(ps_query_counter(hdevice, k, &v[k]), { return err; });
++    }
++    std::string line;
++    for (uint32_t k = 0; k < VX_PS_CNT_NUM; ++k) {
++      if (!line.empty())
++        line += ", ";
++      line += ps_counter_name(k) + "=" + std::to_string(v[k]);
++      if (k + 1 == VX_PS_CNT_NUM || ps_counter_line(k + 1) != ps_counter_line(k)) {
++        perf_print(stream, "ps: %s", line.c_str());
++        line.clear();
++      }
++    }
++    static const char* const cls[VX_PS_NUM_CLASSES] = {"ord", "wgt", "kvp", "kvs", "dxa", "c5", "c6", "c7"};
++    std::string der;
++    for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) {
++      const uint64_t rd = v[VX_PS_CNT_DRAM_RD_DONE + c], acc = v[VX_PS_CNT_L2_ACCESSES + c];
++      if (rd == 0 && acc == 0)
++        continue;
++      char buf[160];
++      std::snprintf(buf, sizeof(buf), "%sdram_rd_wait_mean_%s=%.2f", der.empty() ? "" : ", ", cls[c],
++                    safe_div((double)v[VX_PS_CNT_DRAM_RD_WAIT + c], (double)rd));
++      der += buf;
++      if (acc != 0) {   // no L2 (bypassed): no hit rate
++        std::snprintf(buf, sizeof(buf), ", l2_hit_%s=%d%%", cls[c], calc_ratio(v[VX_PS_CNT_L2_MISSES + c], acc));
++        der += buf;
++      }
++    }
++    perf_print(stream, "ps-derived: %s", der.empty() ? "no traffic" : der.c_str());
++  } break;
++
+   default:
+     fprintf(stream, "Error: invalid profiling class: %d)", mpm_class);
+     return VX_ERR_INVALID_VALUE;

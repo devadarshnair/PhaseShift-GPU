@@ -1,0 +1,395 @@
+diff --git a/sim/common/phase_config.h b/sim/common/phase_config.h
+index f362838c5..82bcb99da 100644
+--- a/sim/common/phase_config.h
++++ b/sim/common/phase_config.h
+@@ -17,7 +17,7 @@
+ //                 VX_PHASE_FLAG_RANGE_ACCT_ONLY (patch mem-class: ranges for accounting only); other bits reserved
+ //   l1_waymask    L1 dcache allowed-way mask (0 = all ways, stock)
+ //   l2_waymask    L2 allowed-way mask (0 = all ways, stock)
+-//   insert_policy L2 insertion policy id for mechanism D (0 = stock)
++//   insert_policy L2 insertion policy for mechanism D and its baselines (0 = stock; encoding below, patch kv-insert)
+ //   dxa_depth[c]  DXA in-flight depth limit for request class c = 0..7 (8 bits each; 0 = stock, unlimited)
+ //   dram_sched    DRAM scheduler mode for mechanism B (0 = stock)
+ //   dram_aging    DRAM aging window in cycles (0 = none)
+@@ -57,6 +57,43 @@ struct PhaseConfig {
+ 
+   bool persist_l2() const { return (flags & VX_PHASE_FLAG_PERSIST_L2) != 0; }
+ 
++  // PhaseShift patch kv-insert (semantics in docs/methodology.md §14.D). insert_policy encoding, acted
++  // on by the L2 only (Cache::ps_set_insert_capable), and only with PLRU replacement there (Cluster rejects it
++  // otherwise):
++  //   bits 1:0  D mode for KV_STREAM fills: 0 off, 1 insert at LRU (the fill gets the set's oldest age), 2 bypass
++  //             (a KV_STREAM read whose line is not in the L2 goes to memory through the non-cacheable path and is
++  //             not allocated); 3 reserved
++  //   bit 4     rtl_like_fill baseline: fills do not touch the replacement state (RTL VX_cache_repl advances PLRU on
++  //             lookup hits only); combinable with bits 1:0
++  //   bit 8     NVIDIA-practice static window baseline (CUDA accessPolicyWindow analogue): wgt range = persisting
++  //             window with hitRatio, kv[0]/kv[1] = streaming; exclusive with bits 1:0; per-launch static (a
++  //             schedule may not change bits 8..24 inside a launch)
++  //   bits 15:12 window set-aside ways per set for persisting lines (0 = 3/4 of the ways)
++  //   bits 24:16 window hitRatio numerator out of 256 (0 = 256 = 1.0)
++  // Any other bit set is rejected.
++  static constexpr uint32_t INS_D_MASK = 0x3, INS_D_LRU = 1, INS_D_BYPASS = 2, INS_RTL_FILL = 0x10,
++                            INS_WINDOW = 0x100, INS_WIN_STATIC_MASK = 0x1ffff00, INS_VALID_MASK = 0x1fff113;
++  uint32_t ins_d() const { return insert_policy & INS_D_MASK; }
++  bool ins_rtl_fill() const { return (insert_policy & INS_RTL_FILL) != 0; }
++  bool ins_window() const { return (insert_policy & INS_WINDOW) != 0; }
++  uint32_t ins_win_ways(uint32_t ways) const {
++    uint32_t w = (insert_policy >> 12) & 0xf;
++    if (w == 0) w = (3 * ways) / 4;
++    return w < ways ? w : ways;
++  }
++  uint32_t ins_win_hit256() const {
++    uint32_t h = (insert_policy >> 16) & 0x1ff;
++    return (h == 0 || h > 256) ? 256 : h;
++  }
++  // Empty string if valid, else the reason.
++  static const char* insert_policy_error(uint32_t v) {
++    if (v & ~INS_VALID_MASK) return "reserved bits set";
++    if ((v & INS_D_MASK) == 3) return "D mode 3 is reserved";
++    if ((v & INS_WINDOW) && (v & INS_D_MASK)) return "window baseline and D are exclusive";
++    if (!(v & INS_WINDOW) && (v & 0x1fff000)) return "window fields set without the window bit";
++    return "";
++  }
++
+   // PhaseShift patch mem-class (rules in docs/methodology.md §12). Address-range classification: a
+   // request whose class is still ORDINARY (no mem_hint) is classified by the first range that contains its address,
+   // in the fixed order kv[0] -> KV_STREAM, kv[1] -> KV_PERSIST, wgt -> WEIGHT (the host programs kv[0] with the KV
+diff --git a/sim/simx/cluster.cpp b/sim/simx/cluster.cpp
+index 28f966225..25579f4d9 100644
+--- a/sim/simx/cluster.cpp
++++ b/sim/simx/cluster.cpp
+@@ -89,6 +89,8 @@ public:
+     l2cache_->ps_count_link_inputs();
+     // PhaseShift (patch sched-replay): the L2 is the only cache that honours the persist_l2 sensitivity knob
+     l2cache_->ps_set_persist_capable(true);
++    // PhaseShift (patch kv-insert): mechanism D and its baselines act at the L2 only
++    l2cache_->ps_set_insert_capable(true);
+ 
+ 
+     // connect l2cache memory interface
+@@ -426,6 +428,22 @@ public:
+   int dcr_write(uint32_t addr, uint32_t value) {
+     // PhaseShift (patch dcr-phase): latch [dcr_phase] into the L2, then broadcast to the sockets below.
+     if (PhaseConfig::is_phase_dcr(addr)) {
++      // PhaseShift (patch kv-insert): the insert policy is defined on the L2 age-counter PLRU only (methodology §14.D);
++      // a malformed word or any other L2 policy aborts the simulation instead of silently doing something else.
++      if (addr == VX_DCR_PHASE_INSERT_POLICY && value != 0) {
++        const char* err = PhaseConfig::insert_policy_error(value);
++        if (err[0] != 0) {
++          std::cerr << "Error: [dcr_phase] insert=0x" << std::hex << value << std::dec << " rejected: " << err
++                    << std::endl;
++          std::abort();
++        }
++        if (uint32_t(VX_CFG_L2_REPL_POLICY) != uint32_t(Cache::PLRU)) {
++          std::cerr << "Error: [dcr_phase] insert=0x" << std::hex << value << std::dec
++                    << " rejected: mechanism D needs PLRU (2) at the L2, VX_CFG_L2_REPL_POLICY=" << VX_CFG_L2_REPL_POLICY
++                    << std::endl;
++          std::abort();
++        }
++      }
+       phase_cfg_.write(addr, value);
+       l2cache_->set_phase_config(phase_cfg_);
+     }
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+index 4101ee87d..94b9e9929 100644
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -11,6 +11,7 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++#include <unordered_set>
+ #include "cache.h"
+ #include "mem_block_pool.h"
+ #include "debug.h"
+@@ -159,6 +160,11 @@ struct line_t {
+   uint64_t tag;
+   uint32_t lru_ctr;
+   std::vector<sector_t> sectors;       // sectors_per_line (1 when no sectoring)
++  // PhaseShift (patch kv-insert, methodology §14.D): ps_low = installed at low priority (D insert-at-LRU, or a window
++  // baseline streaming line); until its first pipelined lookup hit, replays of the chain that filled it do not
++  // promote it. ps_persist = window-baseline persisting line. Both false unless the L2 insert policy is non-zero.
++  bool ps_low = false;
++  bool ps_persist = false;
+ 
+   bool any_valid() const {
+     for (const auto &s : sectors) if (s.valid) return true;
+@@ -170,6 +176,8 @@ struct line_t {
+   }
+   void reset() {
+     lru_ctr = 0;
++    ps_low = false;
++    ps_persist = false;
+     for (auto &s : sectors) s.reset();
+   }
+ };
+@@ -277,6 +285,7 @@ struct set_t {
+         continue;
+       if ((int)i == hit_line_id) {
+         line.lru_ctr = 0;
++        line.ps_low = false;   // PhaseShift (patch kv-insert): a reuse hit promotes a low-priority line normally
+       } else {
+         ++line.lru_ctr;
+       }
+@@ -325,6 +334,49 @@ struct set_t {
+     return (*free_line_id != -1) ? *free_line_id : *repl_line_id;
+   }
+ 
++  // PhaseShift (patch kv-insert): the age that places a line at the LRU end of this set: one more than the oldest
++  // other valid line (saturating), so the next victim selection (max age, ties to the higher way) picks it.
++  uint32_t ps_lru_age(int except_id) const {
++    uint32_t m = 0;
++    bool any = false;
++    for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
++      if ((int)i == except_id || !lines.at(i).any_valid())
++        continue;
++      if (!any || lines.at(i).lru_ctr > m) m = lines.at(i).lru_ctr;
++      any = true;
++    }
++    if (!any) return 0;
++    return (m == UINT32_MAX) ? m : m + 1;
++  }
++
++  // PhaseShift (patch kv-insert): victim for the NVIDIA-practice window baseline (methodology §14.D). Persisting
++  // lines may hold at most `persist_ways` ways of the set (the set-aside): a persisting fill into a set that already
++  // holds that many persisting lines replaces the oldest persisting line; every other fill takes a free way, else the
++  // oldest non-persisting line (else, if every way persists, the oldest line). Ties: higher way, as select_victim.
++  int ps_window_victim(bool incoming_persist, uint32_t persist_ways) const {
++    uint32_t npersist = 0;
++    int free_id = -1;
++    for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
++      const auto &l = lines.at(i);
++      if (!l.any_valid()) { if (free_id == -1) free_id = i; continue; }
++      if (l.ps_persist) ++npersist;
++    }
++    const bool from_persist = incoming_persist && npersist >= persist_ways && npersist > 0;
++    if (!from_persist && free_id != -1)
++      return free_id;
++    int best = -1, any_best = 0;
++    uint32_t best_age = 0, any_age = 0;
++    bool any_set = false;
++    for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
++      const auto &l = lines.at(i);
++      if (!l.any_valid()) continue;
++      if (!any_set || l.lru_ctr >= any_age) { any_age = l.lru_ctr; any_best = i; any_set = true; }
++      if (l.ps_persist != from_persist) continue;
++      if (best == -1 || l.lru_ctr >= best_age) { best_age = l.lru_ctr; best = i; }
++    }
++    return (best != -1) ? best : any_best;
++  }
++
+   // Find the way currently resident for `tag` (any sector valid), or -1.
+   int find_resident(uint64_t tag) const {
+     for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
+@@ -710,6 +762,23 @@ public:
+   // persist_l2 sensitivity knob (null until Cache::Impl sets it; the constructor's on_reset() is a full reset).
+   void ps_set_owner(const Cache *owner) { ps_owner_ = owner; }
+ 
++  // PhaseShift (patch kv-insert): true if this bank holds, is filling, or has in its pipe the line of `addr` (then a D
++  // bypass of a read to it must not be taken: the bank may hold newer data than memory, or a fill is on its way).
++  bool ps_line_busy(uint64_t addr) const {
++    uint32_t set_id = params_.addr_set_id(addr);
++    uint64_t tag = params_.addr_tag(addr);
++    if (sets_.at(set_id).find_resident(tag) != -1)
++      return true;
++    for (uint32_t s = 0; s < params_.sectors_per_line; ++s)
++      if (mshr_.lookup(set_id, tag, s))
++        return true;
++    for (const auto &pl : pipe_core_lines_)
++      if (pl.first == set_id && pl.second == tag)
++        return true;
++    return false;
++  }
++  void ps_count_bypass(uint32_t cls) { ++mshr_.ps_stats_.fill_bypassed[cls & (VX_PS_NUM_CLASSES - 1)]; }
++
+   // PhaseShift (patch sched-replay): drop every line of this bank holding `addr` (any sector), dirty or not. Called
+   // only between launches in persist mode, for host writes to device memory (the flush that follows every launch
+   // has already written back and cleaned every dirty line). Returns the number of lines dropped.
+@@ -1098,12 +1167,40 @@ private:
+     int resident_id = set.find_resident(addr_tag);
+     const bool is_refill = (resident_id != -1);
+ 
++    // PhaseShift (patch kv-insert, methodology §14.D): the L2 insert policy (0 = stock, everywhere else 0 too).
++    const uint32_t ps_ins = (ps_owner_ != nullptr) ? ps_owner_->ps_insert() : 0u;
++    const uint32_t ps_cls = bank_req.flags.mem_class;
++    bool ps_win_persist = false, ps_low = false;
++    if (ps_ins != 0) {
++      const PhaseConfig &pc = ps_owner_->phase_config();
++      if (pc.ins_window()) {
++        // CUDA accessPolicyWindow analogue: an address in the weight window persists with probability hitRatio,
++        // chosen by a fixed hash of the line address (the rest of the window streams); the KV ranges stream.
++        const uint64_t line_addr = bank_req.addr >> config_.L;
++        const uint32_t h = uint32_t((line_addr * 0x9E3779B97F4A7C15ull) >> 56);   // 0..255
++        if (pc.wgt.contains(bank_req.addr)) {
++          ps_win_persist = h < pc.ins_win_hit256();
++          ps_low = !ps_win_persist;
++        } else if (pc.kv[0].contains(bank_req.addr) || pc.kv[1].contains(bank_req.addr)) {
++          ps_low = true;
++        }
++      } else {
++        ps_low = (ps_cls == VX_PS_CLASS_KV_STREAM) && (pc.ins_d() != 0);
++      }
++    }
++
+     int line_id;
++    uint32_t ps_victim_age = 0;   // PhaseShift (patch kv-insert): replacement state of the way before this fill
+     if (is_refill) {
+       line_id = resident_id; // add a sector to the resident copy; no eviction
++      ps_victim_age = set.lines.at(resident_id).lru_ctr;
+     } else {
+       int32_t free_id = -1, repl_id = 0;
+-      line_id = set.select_victim(config_.repl_policy, rand_ctr_, &free_id, &repl_id);
++      if (ps_ins != 0 && ps_owner_->phase_config().ins_window()) {
++        line_id = set.ps_window_victim(ps_win_persist, ps_owner_->phase_config().ins_win_ways(set.lines.size()));
++      } else {
++        line_id = set.select_victim(config_.repl_policy, rand_ctr_, &free_id, &repl_id);
++      }
+       auto &victim_line = set.lines.at(line_id);
+ 
+       // Count the victim's dirty sectors; the egress queue must accept all
+@@ -1146,13 +1243,29 @@ private:
+       }
+ 
+       // Repurpose the victim way for the new line: all sectors invalid.
++      ps_victim_age = victim_line.lru_ctr;   // PhaseShift (patch kv-insert): rtl_like_fill keeps the way's state
+       victim_line.reset();
+       victim_line.tag = addr_tag;
+     }
+ 
+     auto &line = set.lines.at(line_id);
+     line.tag     = addr_tag;
+-    line.lru_ctr = 0;
++    if (ps_ins == 0) {
++      line.lru_ctr = 0;   // stock SimX: a fill inserts at MRU
++    } else {
++      // PhaseShift (patch kv-insert): low-priority fills go to the LRU end; with rtl_like_fill every other fill leaves
++      // the replacement state as it was (RTL PLRU advances on lookup hits only); otherwise MRU as stock.
++      if (ps_low) {
++        line.lru_ctr = set.ps_lru_age(line_id);
++        line.ps_low  = true;
++        ++mshr_.ps_stats_.fill_demoted[ps_cls & (VX_PS_NUM_CLASSES - 1)];
++      } else {
++        line.ps_low = false;
++        line.lru_ctr = ps_owner_->phase_config().ins_rtl_fill() ? ps_victim_age : 0u;
++      }
++      if (!is_refill)
++        line.ps_persist = ps_win_persist;
++    }
+     auto &sec    = line.sectors.at(sector_id);
+     sec.valid      = true;
+     sec.dirty      = false;
+@@ -1556,8 +1669,11 @@ private:
+         crsp_sent_ = true;
+         DT(3, this->name() << " replay-rsp: " << rsp);
+       }
++      // PhaseShift (patch kv-insert): the replay of the chain that filled a low-priority line is the same access,
++      // not a reuse: it ages the set like a miss instead of promoting the line (ps_low is only ever set when the L2
++      // insert policy is non-zero, so the stock path is unchanged).
+       if (config_.repl_policy == Cache::PLRU)
+-        set.update_lru(hit_id);
++        set.update_lru(set.lines.at(hit_id).ps_low ? -1 : hit_id);
+ 
+       pipe_req_->pop();
+     } break;
+@@ -1940,6 +2056,7 @@ public:
+     // PhaseShift (patch sched-replay): persist mode skips the invalidation walk these cycles model (the lines are
+     // kept, CacheBank::on_reset()).
+     init_cycles_ = simobject_->ps_persist_active() ? 0 : params_.sets_per_bank;
++    ps_written_.clear();   // PhaseShift (patch kv-insert)
+   }
+ 
+   // PhaseShift (patch sched-replay): drop every line overlapping [addr, addr + size) (line granularity).
+@@ -2005,6 +2122,26 @@ public:
+         const PhaseConfig& pc = simobject_->phase_config();
+         uint32_t rcls = (core_req.flags.mem_class == VX_PS_CLASS_ORDINARY) ? pc.range_class(core_req.addr)
+                                                                             : VX_PS_CLASS_ORDINARY;
++        // PhaseShift (patch kv-insert, methodology §14.D): D bypass. A KV_STREAM plain read whose line the L2 neither
++        // holds nor is fetching is sent to memory on the non-cacheable path (the stock io-bypass port) and is not
++        // allocated. Writes, atomics, reads of busy lines and reads of any line written since the launch began (a
++        // store may still be on its way to the bank, so memory may be stale) take the normal path.
++        const uint32_t ecls = (rcls != VX_PS_CLASS_ORDINARY) ? rcls : core_req.flags.mem_class;
++        const uint32_t ins = simobject_->ps_insert();
++        const uint64_t ps_line = core_req.addr >> config_.L;
++        if (ins != 0 && core_req.op != MemOp::LD)
++          ps_written_.insert(ps_line);   // any non-load (store, AMO) to the line since the launch began
++        if ((ins & PhaseConfig::INS_D_MASK) == PhaseConfig::INS_D_BYPASS && ecls == VX_PS_CLASS_KV_STREAM
++         && core_req.op == MemOp::LD && ps_written_.count(ps_line) == 0
++         && !banks_.at(params_.addr_bank_id(core_req.addr))->ps_line_busy(core_req.addr)) {
++          MemReq creq(core_req);
++          creq.flags.mem_class = ecls;
++          if (this->processBypassRequest(creq, req_id)) {
++            banks_.at(params_.addr_bank_id(core_req.addr))->ps_count_bypass(ecls);
++            core_req_in.pop();
++          }
++          continue;
++        }
+         if (rcls != VX_PS_CLASS_ORDINARY) {
+           MemReq creq(core_req);
+           creq.flags.mem_class = rcls;
+@@ -2089,6 +2226,7 @@ private:
+   std::vector<MemArbiter::Ptr> nc_mem_arbs_;
+   MemCrossBar::Ptr bank_core_xbar_;
+   uint32_t init_cycles_;
++  std::unordered_set<uint64_t> ps_written_;   // PhaseShift (patch kv-insert): lines written this launch (D bypass)
+ };
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+diff --git a/sim/simx/mem/cache.h b/sim/simx/mem/cache.h
+index c13da30c8..b8a283f9d 100644
+--- a/sim/simx/mem/cache.h
++++ b/sim/simx/mem/cache.h
+@@ -80,8 +80,9 @@ public:
+ 	//   link_rd/wr[c]  requests (one memory block each) delivered INTO the cache's core-side input ports, by class as
+ 	//                  they arrive (before this cache's range classification); counted for bypassed caches too, and
+ 	//                  only where ps_count_link_inputs() was called (the L2s: the L1/DXA -> L2 link)
+-	//   fill_demoted/bypassed[c]  fills inserted at low priority / not allocated (mechanism D); this patch
+-	//                  never increments them
++	//   fill_demoted/bypassed[c]  fills inserted at low priority (D insert-at-LRU, or a window-baseline streaming
++	//                  line) / read requests sent around the L2 without allocation (D bypass), by the fill's /
++	//                  request's class (patch kv-insert, 0 unless the L2 insert policy is non-zero)
+ 	struct PsClassStats {
+ 		uint64_t reqs[VX_PS_NUM_CLASSES] = {};
+ 		uint64_t mixed_merges = 0;
+@@ -144,6 +145,12 @@ public:
+ 	// Drop every line overlapping [addr, addr + size) (host writes in persist mode; returns lines dropped).
+ 	uint64_t ps_invalidate_range(uint64_t addr, uint64_t size);
+ 
++	// PhaseShift (patch kv-insert, methodology §14.D): mechanism D and its baselines act only in a cache
++	// marked insert-capable (the L2, Cluster); every other cache sees insert policy 0 (stock). ps_insert() is the
++	// policy word in force (PhaseConfig::INS_*).
++	void ps_set_insert_capable(bool v) { ps_insert_capable_ = v; }
++	uint32_t ps_insert() const { return ps_insert_capable_ ? phase_cfg_.insert_policy : 0u; }
++
+ protected:
+ 	void on_reset();
+ 	void on_tick();
+@@ -153,6 +160,7 @@ private:
+ 	Impl* impl_;
+ 	PhaseConfig phase_cfg_;
+ 	bool ps_persist_capable_ = false;   // PhaseShift (patch sched-replay)
++	bool ps_insert_capable_ = false;    // PhaseShift (patch kv-insert)
+ 	uint64_t ps_link_rd_[VX_PS_NUM_CLASSES] = {};   // PhaseShift (patch ps-counters), see ps_count_link_inputs()
+ 	uint64_t ps_link_wr_[VX_PS_NUM_CLASSES] = {};
+ 
+diff --git a/sim/simx/ps_schedule.h b/sim/simx/ps_schedule.h
+index b2e158d1e..6d7f65596 100644
+--- a/sim/simx/ps_schedule.h
++++ b/sim/simx/ps_schedule.h
+@@ -104,8 +104,16 @@ public:
+   const PhaseConfig& apply_due(uint64_t work, uint64_t cycle) {
+     while (next_ < active_.size() && work >= lines_[active_[next_]].work) {
+       const Line& l = lines_[active_[next_]];
++      const uint32_t ins0 = eff_.insert_policy;
+       for (const auto& st : l.sets)
+         set(eff_, st);
++      // PhaseShift (patch kv-insert): the NVIDIA-practice window baseline is static per launch (set by the host
++      // or a work_count-0 line, never switched inside a kernel; methodology §14.D).
++      if (l.work > 0 && ((ins0 ^ eff_.insert_policy) & PhaseConfig::INS_WIN_STATIC_MASK) != 0) {
++        std::cerr << "Error: PS_SCHEDULE line " << l.lineno << ": the window baseline (insert bits 8..24) is static "
++                  << "per launch and cannot change at work_count " << l.work << std::endl;
++        std::abort();
++      }
+       modified_ = true;
+       std::cout << "PSSCHED launch=" << launch_ << " line=" << l.lineno << " work_count=" << l.work << " work=" << work
+                 << " cycle=" << cycle << " " << eff_.str() << std::endl;

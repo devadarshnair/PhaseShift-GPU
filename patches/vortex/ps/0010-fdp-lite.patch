@@ -1,0 +1,400 @@
+diff --git a/sim/common/phase_config.h b/sim/common/phase_config.h
+index 28f797585..fe0fc3571 100644
+--- a/sim/common/phase_config.h
++++ b/sim/common/phase_config.h
+@@ -14,7 +14,8 @@
+ // Field semantics (encoding only; each mechanism patch documents its meaning in docs/methodology.md §14):
+ //   mode          global PhaseShift mode / phase id (0 = off)
+ //   flags         bit 0 VX_PHASE_FLAG_PERSIST_L2 (sensitivity knob; never set by default); bit 1
+-//                 VX_PHASE_FLAG_RANGE_ACCT_ONLY (patch mem-class: ranges for accounting only); other bits reserved
++//                 VX_PHASE_FLAG_RANGE_ACCT_ONLY (patch mem-class: ranges for accounting only); bit 2 + bits 31:16
++//                 FDP-lite DXA policy + its epoch (patch fdp-lite, FLAG_DXA_FDP below); other bits reserved
+ //   l1_waymask    L1 dcache allowed-way mask (0 = all ways, stock)
+ //   l2_waymask    L2 allowed-way mask (0 = all ways, stock)
+ //   insert_policy L2 insertion policy for mechanism D and its baselines (0 = stock; encoding below, patch kv-insert)
+@@ -114,6 +115,17 @@ struct PhaseConfig {
+   bool range_acct_only() const { return (flags & VX_PHASE_FLAG_RANGE_ACCT_ONLY) != 0; }
+   bool any_range() const { return !kv[0].empty() || !kv[1].empty() || !wgt.empty(); }
+ 
++  // PhaseShift (patch fdp-lite, docs/methodology.md §14.C.b): flags bit 2 selects the FDP-lite DXA
++  // policy (a phase-ignorant feedback throttle of the per-DxaCore DXA in-flight depth); flags bits 31:16 = its epoch
++  // length E in DxaCore cycles (0 = FDP_E_DEFAULT). Bits 15:3 stay reserved. Bit 2 clear (the reset value) = no
++  // FDP-lite: every consumer behaves exactly as patch dxa-class. Defined here, not in VX_types.toml, because only
++  // SimX's DxaCore and PS_SCHEDULE read it (the base tree ignores the whole [dcr_phase] block).
++  static constexpr uint32_t FLAG_DXA_FDP   = 0x4;
++  static constexpr uint32_t FDP_E_SHIFT    = 16;
++  static constexpr uint32_t FDP_E_DEFAULT  = 8192;
++  bool dxa_fdp() const { return (flags & FLAG_DXA_FDP) != 0; }
++  uint32_t dxa_fdp_epoch() const { const uint32_t e = flags >> FDP_E_SHIFT; return e ? e : FDP_E_DEFAULT; }
++
+   // Accounting regions: 0 = kv[0], 1 = kv[1], 2 = wgt, 3 = none of them (same precedence as the classification).
+   static constexpr uint32_t NUM_REGIONS = 4;
+   uint32_t region_of(uint64_t addr) const {
+diff --git a/sim/simx/barrier_unit.cpp b/sim/simx/barrier_unit.cpp
+index 92349d7ad..1e5bd2865 100644
+--- a/sim/simx/barrier_unit.cpp
++++ b/sim/simx/barrier_unit.cpp
+@@ -162,6 +162,9 @@ void BarrierUnit::event_release(uint32_t bar_id) {
+         barrier.events = 0;
+       }
+     } else {
++      ++ps_async_rel_;   // PhaseShift (patch fdp-lite)
++      if (barrier.count == 0 && barrier.wait_mask.any())
++        ++ps_async_late_;
+       if (barrier.count == 0) {
+         // resume waiting warps
+         for (uint32_t i = 0; i < VX_CFG_NUM_WARPS; ++i) {
+diff --git a/sim/simx/barrier_unit.h b/sim/simx/barrier_unit.h
+index 253fb601c..5b9cfe913 100644
+--- a/sim/simx/barrier_unit.h
++++ b/sim/simx/barrier_unit.h
+@@ -35,6 +35,14 @@ public:
+   void event_attach(uint32_t bar_id, uint32_t count = 1);
+   void event_release(uint32_t bar_id);
+ 
++  // PhaseShift (patch fdp-lite, docs/methodology.md §14.C.b): async-transfer (DXA) completions seen by this core's
++  // barriers, cumulative since construction (never reset). A release is the event_release() that drops a local
++  // barrier's pending events to 0; it is "late" when, at that moment, every arrival is in (count == 0) and at least
++  // one warp is suspended on the barrier, i.e. the consumer was already waiting for the transfer (FDP lateness, C27).
++  // Observation only.
++  uint64_t ps_async_releases() const { return ps_async_rel_; }
++  uint64_t ps_async_late() const { return ps_async_late_; }
++
+ protected:
+   void on_reset();
+ 
+@@ -49,6 +57,7 @@ private:
+   Core*       core_;
+   Scheduler*  scheduler_;
+   std::vector<warp_barrier_t> barriers_;
++  uint64_t ps_async_rel_ = 0, ps_async_late_ = 0;   // PhaseShift (patch fdp-lite)
+ 
+   friend class SimObject<BarrierUnit>;
+ };
+diff --git a/sim/simx/dxa/dxa_core.cpp b/sim/simx/dxa/dxa_core.cpp
+index 54efa5da0..10d7b7267 100644
+--- a/sim/simx/dxa/dxa_core.cpp
++++ b/sim/simx/dxa/dxa_core.cpp
+@@ -16,6 +16,8 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
++#include <cstdio>    // PhaseShift (patch fdp-lite)
++#include <cstdlib>
+ #include <deque>
+ #include <vector>
+ #include "core.h"
+@@ -932,6 +934,10 @@ DxaCore::DxaCore(const SimContext& ctx, const char* name, Socket* socket)
+   }
+ 
+   impl_ = new Impl(this, gmem_arb_.get());
++  {   // PhaseShift (patch fdp-lite): PS_FDP_TRACE=1 prints one PSFDPEP line per FDP-lite epoch (TEST trace)
++    const char* e = std::getenv("PS_FDP_TRACE");
++    ps_fdp_trace_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
++  }
+ }
+ 
+ DxaCore::~DxaCore() {
+@@ -943,12 +949,93 @@ void DxaCore::on_reset() {
+   // PhaseShift (patch ps-counters): the reset drops every in-flight slot; bytes and maxima are cumulative.
+   for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s) ps_dxa_inflight_[s] = 0;
+   for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) ps_cls_inflight_[c] = 0;   // PhaseShift (patch dxa-class)
++  ps_fdp_on_ = false;   // PhaseShift (patch fdp-lite): every launch restarts FDP-lite (init level, new counter base)
++}
++
++// PhaseShift (patch fdp-lite, docs/methodology.md §14.C.b). Called at the start of every DxaCore cycle, before the
++// DXA pipeline ticks, so a level set at an epoch end governs every issue from the next pipeline tick on.
++void DxaCore::ps_fdp_tick() {
++  if (!phase_cfg_.dxa_fdp()) {
++    ps_fdp_on_ = false;
++    return;
++  }
++  if (!ps_fdp_on_) {   // (re)start: launch reset or enable (host DCR / PS_SCHEDULE)
++    ps_fdp_on_ = true;
++    ps_fdp_level_ = FDP_LEVEL_INIT;
++    ps_fdp_in_epoch_ = 0;
++    ps_fdp_t_ = 0;
++    ps_fdp_ep_ = 0;
++    ps_fdp_sl_ = ps_fdp_sd_ = ps_fdp_sr_ = ps_fdp_slt_ = 0.0;
++    this->ps_fdp_sync();
++  }
++  ++ps_fdp_t_;
++  ++ps_fdp.on_ticks;
++  ps_fdp.depth_ticks += this->ps_fdp_depth();
++  if (++ps_fdp_in_epoch_ >= phase_cfg_.dxa_fdp_epoch()) {
++    ps_fdp_in_epoch_ = 0;
++    this->ps_fdp_epoch_end();
++  }
++}
++
++void DxaCore::ps_fdp_sync() {
++  uint64_t l = 0, r = 0, lt = 0;
++  if (ps_fdp_src_) ps_fdp_src_(l, r, lt);
++  uint64_t d = 0;
++  for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s) d += ps_dxa_bytes_[s];
++  ps_fdp_l0_ = l; ps_fdp_d0_ = d; ps_fdp_r0_ = r; ps_fdp_lt0_ = lt;
++  ps_fdp_inf0_ = ps_fdp_emax_ = this->ps_cls_inflight_max_now();
++}
++
++void DxaCore::ps_fdp_epoch_end() {
++  uint64_t l = 0, r = 0, lt = 0;
++  if (ps_fdp_src_) ps_fdp_src_(l, r, lt);
++  uint64_t d = 0;
++  for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s) d += ps_dxa_bytes_[s];
++  // counters are cumulative; a base above the current value (a counter reset) makes the epoch unjudged
++  const bool ok = (l >= ps_fdp_l0_ && d >= ps_fdp_d0_ && r >= ps_fdp_r0_ && lt >= ps_fdp_lt0_);
++  const uint64_t dl = ok ? l - ps_fdp_l0_ : 0, dd = ok ? d - ps_fdp_d0_ : 0;
++  const uint64_t dr = ok ? r - ps_fdp_r0_ : 0, dlt = ok ? lt - ps_fdp_lt0_ : 0;
++  const uint64_t emax = ps_fdp_emax_, inf0 = ps_fdp_inf0_;
++  const uint32_t before = ps_fdp_level_;
++  // C27's interval update: every counter = 1/2 its value at the start of the epoch + 1/2 its count during the epoch,
++  // so older epochs fade geometrically (and a fill that is read one epoch later still counts as useful)
++  ps_fdp_sl_ = 0.5 * ps_fdp_sl_ + 0.5 * double(dl);
++  ps_fdp_sd_ = 0.5 * ps_fdp_sd_ + 0.5 * double(dd);
++  ps_fdp_sr_ = 0.5 * ps_fdp_sr_ + 0.5 * double(dr);
++  ps_fdp_slt_ = 0.5 * ps_fdp_slt_ + 0.5 * double(dlt);
++  // an epoch without DXA GMEM reads has nothing to judge: the level is held
++  const bool judged = ok && dd > 0;
++  const double acc = judged ? std::min(1.0, ps_fdp_sl_ / ps_fdp_sd_) : 0.0;
++  const double late = (judged && ps_fdp_sr_ > 0.0) ? ps_fdp_slt_ / ps_fdp_sr_ : 0.0;
++  if (judged) {
++    ++ps_fdp.judged;
++    if (acc < FDP_ACC_LOW) {
++      if (ps_fdp_level_ > 0) { --ps_fdp_level_; ++ps_fdp.downs; }
++    } else if (late > FDP_LATE_THR) {
++      if (ps_fdp_level_ + 1 < FDP_LEVELS) { ++ps_fdp_level_; ++ps_fdp.ups; }
++    }
++  }
++  ++ps_fdp.epochs;
++  ++ps_fdp.level_epochs[ps_fdp_level_];
++  ++ps_fdp_ep_;
++  if (ps_fdp_trace_)
++    std::printf("PSFDPEP dxa=%s epoch=%llu t=%llu E=%u d_lmem=%llu d_dxa=%llu rel=%llu late=%llu acc=%.6f latef=%.6f"
++                " judged=%d level=%u next=%u depth=%u next_depth=%u emax=%llu inf0=%llu"
++                " s_lmem=%.17g s_dxa=%.17g s_rel=%.17g s_late=%.17g\n",
++                this->name().c_str(), (unsigned long long)ps_fdp_ep_, (unsigned long long)ps_fdp_t_,
++                phase_cfg_.dxa_fdp_epoch(), (unsigned long long)dl, (unsigned long long)dd, (unsigned long long)dr,
++                (unsigned long long)dlt, acc, late, judged ? 1 : 0, before, ps_fdp_level_, FDP_DEPTH[before],
++                FDP_DEPTH[ps_fdp_level_], (unsigned long long)emax, (unsigned long long)inf0,
++                ps_fdp_sl_, ps_fdp_sd_, ps_fdp_sr_, ps_fdp_slt_);
++  ps_fdp_l0_ = l; ps_fdp_d0_ = d; ps_fdp_r0_ = r; ps_fdp_lt0_ = lt;
++  ps_fdp_inf0_ = ps_fdp_emax_ = this->ps_cls_inflight_max_now();
+ }
+ 
+ void DxaCore::ps_cls_issue(uint32_t cls) {
+   cls &= VX_PS_NUM_CLASSES - 1;
+   const uint64_t n = ++ps_cls_inflight_[cls];
+   ps_cls.max_inflight[cls] = std::max(ps_cls.max_inflight[cls], n);
++  ps_fdp_emax_ = std::max(ps_fdp_emax_, n);   // PhaseShift (patch fdp-lite): per-epoch max (trace only)
+ }
+ 
+ void DxaCore::ps_dxa_issue(uint32_t worker) {
+@@ -963,7 +1050,7 @@ void DxaCore::ps_dxa_response(uint32_t worker) {
+   const uint32_t s = std::min<uint32_t>(worker, VX_PS_DXA_STREAMS - 1);
+   if (ps_dxa_inflight_[s] != 0) --ps_dxa_inflight_[s];
+ }
+-void DxaCore::on_tick()  { impl_->tick(); }
++void DxaCore::on_tick()  { this->ps_fdp_tick(); impl_->tick(); }   // PhaseShift (patch fdp-lite): FDP-lite first
+ 
+ int DxaCore::dcr_write(uint32_t addr, uint32_t value) {
+   return impl_->dcr_write(addr, value);
+diff --git a/sim/simx/dxa/dxa_core.h b/sim/simx/dxa/dxa_core.h
+index 980a698ea..d88cdf847 100644
+--- a/sim/simx/dxa/dxa_core.h
++++ b/sim/simx/dxa/dxa_core.h
+@@ -14,6 +14,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include <functional>   // PhaseShift (patch fdp-lite)
+ #include "types.h"
+ #include "dxa_unit.h"
+ #include "phase_config.h"
+@@ -117,7 +118,14 @@ public:
+     cls &= VX_PS_NUM_CLASSES - 1;
+     if (ps_cls_inflight_[cls] != 0) --ps_cls_inflight_[cls];
+   }
+-  uint32_t ps_cls_cap(uint32_t cls) const { return phase_cfg_.dxa_depth[cls & (VX_PS_NUM_CLASSES - 1)]; }
++  // Patch fdp-lite: while FDP-lite runs, the cap of every class is the FDP depth, bounded above by a non-zero static
++  // dxa_depth[c] (the static per-class cap stays an upper bound; no class gets a different policy).
++  uint32_t ps_cls_cap(uint32_t cls) const {
++    const uint32_t st = phase_cfg_.dxa_depth[cls & (VX_PS_NUM_CLASSES - 1)];
++    if (!ps_fdp_on_) return st;
++    const uint32_t d = ps_fdp_depth();
++    return (st != 0 && st < d) ? st : d;
++  }
+   bool ps_cls_capped(uint32_t cls) const {
+     const uint32_t cap = ps_cls_cap(cls);
+     return cap != 0 && ps_cls_inflight_[cls & (VX_PS_NUM_CLASSES - 1)] >= cap;
+@@ -130,6 +138,31 @@ public:
+   };
+   PsClsStats ps_cls;   // counters (maxima + sums), written by Impl
+ 
++  // PhaseShift (patch fdp-lite, docs/methodology.md §14.C.b): FDP-lite, a phase-ignorant feedback
++  // throttle of this DxaCore's DXA in-flight depth (after C27, Srinath et al., HPCA 2007). Selected by [dcr_phase]
++  // flags bit 2 (PhaseConfig::dxa_fdp, host DCR or PS_SCHEDULE knob dxa_fdp=E). Every E DxaCore cycles (an epoch) it
++  // reads this socket's measured accuracy (min(1, core LMEM read bytes / DXA GMEM read bytes)) and lateness (late /
++  // all async-transfer barrier releases, BarrierUnit), each counter half-decayed per epoch as in C27, and moves an aggressiveness level
++  // 0..FDP_LEVELS-1 by at most one step; depth = FDP_DEPTH[level]. The level changes ONLY at an epoch end. Inputs:
++  // the source callback (set by the socket) and this core's DXA byte counter; it reads no phase id, mode, class
++  // label or schedule position.
++  static constexpr uint32_t FDP_LEVELS = 5;
++  static constexpr uint32_t FDP_DEPTH[FDP_LEVELS] = {1, 2, 4, 6, 8};
++  static constexpr uint32_t FDP_LEVEL_INIT = 2;          // start in the middle (depth 4)
++  static constexpr double   FDP_ACC_LOW  = 0.40;         // accuracy below this -> one level less aggressive
++  static constexpr double   FDP_ACC_HIGH = 0.75;         // high vs medium: same action here (no pollution input)
++  static constexpr double   FDP_LATE_THR = 0.01;         // lateness above this (and accuracy >= low) -> one level more
++  // (lmem_rd_bytes, async releases, late releases), cumulative, of the cores this DxaCore serves
++  using PsFdpSource = std::function<void(uint64_t&, uint64_t&, uint64_t&)>;
++  void ps_fdp_set_source(PsFdpSource f) { ps_fdp_src_ = std::move(f); }
++  uint32_t ps_fdp_depth() const { return FDP_DEPTH[ps_fdp_level_]; }
++  struct PsFdpStats {
++    uint64_t epochs = 0, judged = 0, ups = 0, downs = 0, on_ticks = 0, depth_ticks = 0;
++    uint64_t level_epochs[FDP_LEVELS] = {};   // epochs that ended at each level
++  };
++  PsFdpStats ps_fdp;   // cumulative since construction
++  uint32_t ps_fdp_level() const { return ps_fdp_level_; }
++
+ protected:
+   void on_reset();
+   void on_tick();
+@@ -144,6 +177,25 @@ private:
+   uint64_t ps_dxa_max_tot_[VX_PS_DXA_STREAMS] = {};
+   uint64_t ps_dxa_max_win_[VX_PS_DXA_STREAMS] = {};
+   uint64_t ps_cls_inflight_[VX_PS_NUM_CLASSES] = {};    // PhaseShift (patch dxa-class)
++  // PhaseShift (patch fdp-lite)
++  void ps_fdp_tick();
++  void ps_fdp_epoch_end();
++  void ps_fdp_sync();
++  PsFdpSource ps_fdp_src_;
++  bool     ps_fdp_on_ = false;     // FDP-lite running (restarted at every launch reset and at every enable)
++  bool     ps_fdp_trace_ = false;  // PS_FDP_TRACE=1: one PSFDPEP line per epoch
++  uint32_t ps_fdp_level_ = FDP_LEVEL_INIT;
++  uint32_t ps_fdp_in_epoch_ = 0;   // DxaCore cycles since the last epoch boundary
++  uint64_t ps_fdp_t_ = 0;          // DxaCore cycles since FDP-lite (re)started
++  uint64_t ps_fdp_ep_ = 0;         // epochs since FDP-lite (re)started
++  uint64_t ps_fdp_l0_ = 0, ps_fdp_d0_ = 0, ps_fdp_r0_ = 0, ps_fdp_lt0_ = 0;   // counter bases of the epoch
++  double   ps_fdp_sl_ = 0, ps_fdp_sd_ = 0, ps_fdp_sr_ = 0, ps_fdp_slt_ = 0;   // half-decayed epoch counters (C27)
++  uint64_t ps_fdp_emax_ = 0, ps_fdp_inf0_ = 0;   // max per-class reads in flight during the epoch / at its start
++  uint64_t ps_cls_inflight_max_now() const {
++    uint64_t m = 0;
++    for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) m = std::max(m, ps_cls_inflight_[c]);
++    return m;
++  }
+ 
+   friend class SimObject<DxaCore>;
+ };
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index 5ffe52c6e..36b11fe1c 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -404,6 +404,13 @@ void ProcessorImpl::ps_dxa_report() const {
+             << " lmem_writes=" << col.dxa_lmem_writes << " transfers=" << col.dxa_transfers
+             << " mc_transfers=" << col.dxa_mc_transfers << " mc_replay_beats=" << col.dxa_mc_replay_beats
+             << std::endl;
++  // PhaseShift (patch fdp-lite): one PSFDP line, only if FDP-lite ran (so every pre-existing run prints the same)
++  if (col.fdp_on_ticks != 0) {
++    std::cout << "PSFDP launch=" << (phase_launches_ ? phase_launches_ - 1 : 0) << " epochs=" << col.fdp_epochs
++              << " judged=" << col.fdp_judged << " ups=" << col.fdp_ups << " downs=" << col.fdp_downs
++              << " on_cycles=" << col.fdp_on_ticks << " depth_cycles=" << col.fdp_depth_ticks << " mean_depth=" << (double(col.fdp_depth_ticks) / double(col.fdp_on_ticks))
++              << " level_epochs=" << list(col.fdp_level_epochs, 5) << " level_last=" << col.fdp_level_last << std::endl;
++  }
+ }
+ 
+ void ProcessorImpl::ps_class_report(const char* when) const {
+diff --git a/sim/simx/ps_schedule.h b/sim/simx/ps_schedule.h
+index 6d7f65596..27a6006fd 100644
+--- a/sim/simx/ps_schedule.h
++++ b/sim/simx/ps_schedule.h
+@@ -44,7 +44,7 @@ public:
+   enum Unit { MARKS = 0, INSTRS = 1 };
+ 
+   struct Set {
+-    enum Knob { MODE, INSERT, DXA_DEPTH, DRAM_SCHED, DRAM_AGING, KV_BASE, KV_LIMIT, WGT_BASE, WGT_LIMIT, RANGE_ACCT };
++    enum Knob { MODE, INSERT, DXA_DEPTH, DRAM_SCHED, DRAM_AGING, KV_BASE, KV_LIMIT, WGT_BASE, WGT_LIMIT, RANGE_ACCT, DXA_FDP };
+     Knob     knob;
+     uint32_t idx;     // dxa_depth class / kv range index
+     uint64_t value;
+@@ -153,6 +153,10 @@ private:
+     case Set::KV_LIMIT:   c.kv[s.idx].limit = s.value; break;
+     case Set::WGT_BASE:   c.wgt.base = s.value; break;
+     case Set::WGT_LIMIT:  c.wgt.limit = s.value; break;
++    case Set::DXA_FDP:
++      c.flags = (c.flags & 0x0000fffbu)
++              | (s.value ? (PhaseConfig::FLAG_DXA_FDP | (uint32_t(s.value) << PhaseConfig::FDP_E_SHIFT)) : 0u);
++      break;
+     case Set::RANGE_ACCT:
+       c.flags = s.value ? (c.flags | VX_PHASE_FLAG_RANGE_ACCT_ONLY) : (c.flags & ~uint32_t(VX_PHASE_FLAG_RANGE_ACCT_ONLY));
+       break;
+@@ -221,6 +225,9 @@ private:
+         else if (k == "wgt_base") { s.knob = Set::WGT_BASE; max = ~0ull; }
+         else if (k == "wgt_limit") { s.knob = Set::WGT_LIMIT; max = ~0ull; }
+         else if (k == "range_acct_only") { s.knob = Set::RANGE_ACCT; max = 1; }
++        // PhaseShift (patch fdp-lite): dxa_fdp=E turns the FDP-lite DXA policy on with epoch E cycles (1..65535),
++        // dxa_fdp=0 turns it off (flags bit 2 + bits 31:16 only; persist_l2 and the other flag bits are untouched).
++        else if (k == "dxa_fdp") { s.knob = Set::DXA_FDP; max = 0xffff; }
+         else
+           fail(path, lineno, "unknown knob '" + k + "'");
+         if (s.value > max)
+diff --git a/sim/simx/socket.cpp b/sim/simx/socket.cpp
+index 760e799d7..a280e12df 100644
+--- a/sim/simx/socket.cpp
++++ b/sim/simx/socket.cpp
+@@ -21,6 +21,7 @@
+ #ifdef VX_CFG_EXT_DXA_ENABLE
+ #include "dxa_core.h"
+ #include "local_mem.h"
++#include "scheduler.h"   // PhaseShift (patch fdp-lite): BarrierUnit counters
+ #include "sfu_unit.h"
+ #endif
+ #ifdef VX_CFG_EXT_TEX_ENABLE
+@@ -272,6 +273,21 @@ public:
+       cores_.at(i) = Core::Create(sname, core_id, simobject_);
+     }
+ 
++#ifdef VX_CFG_EXT_DXA_ENABLE
++    // PhaseShift (patch fdp-lite, methodology §14.C.b): FDP-lite feedback inputs of this socket's DxaCore = its cores'
++    // LMEM read bytes (LocalMem read requests x one LSU word, as PADC-lite) and async-transfer barrier releases / late
++    // releases (BarrierUnit). Cumulative, read-only.
++    dxa_core_->ps_fdp_set_source([this](uint64_t& lmem_rd_bytes, uint64_t& rel, uint64_t& late) {
++      lmem_rd_bytes = rel = late = 0;
++      for (auto& core : cores_) {
++        lmem_rd_bytes += core->local_mem()->perf_stats().reads * LSU_WORD_SIZE;
++        auto& bu = core->scheduler().barrier_unit();
++        rel  += bu.ps_async_releases();
++        late += bu.ps_async_late();
++      }
++    });
++#endif
++
+     // connect cores to caches
+     for (uint32_t i = 0; i < cores_per_socket; ++i) {
+         cores_.at(i)->icache_req_out.at(0).bind(&icaches_->core_req_in.at(i).at(0));
+@@ -444,6 +460,12 @@ public:
+       out.dxa_mc_transfers += pc.mc_transfers;
+       out.dxa_lmem_writes += dxa_core_->perf_stats().lmem_writes;
+       out.dxa_transfers += dxa_core_->perf_stats().transfers;
++      const auto& fd = dxa_core_->ps_fdp;   // PhaseShift (patch fdp-lite)
++      out.fdp_epochs += fd.epochs; out.fdp_judged += fd.judged; out.fdp_ups += fd.ups; out.fdp_downs += fd.downs;
++      out.fdp_on_ticks += fd.on_ticks; out.fdp_depth_ticks += fd.depth_ticks;
++      static_assert(DxaCore::FDP_LEVELS == sizeof(out.fdp_level_epochs) / sizeof(out.fdp_level_epochs[0]), "fdp-lite");
++      for (uint32_t k = 0; k < DxaCore::FDP_LEVELS; ++k) out.fdp_level_epochs[k] += fd.level_epochs[k];
++      out.fdp_level_last = dxa_core_->ps_fdp_level();
+     }
+ #endif
+     for (auto& core : cores_) {
+diff --git a/sim/simx/socket.h b/sim/simx/socket.h
+index b73d1d727..5db33ff5f 100644
+--- a/sim/simx/socket.h
++++ b/sim/simx/socket.h
+@@ -48,6 +48,10 @@ struct PsClassCollect {
+   uint64_t dxa_cls_cap_stalls[VX_PS_NUM_CLASSES] = {};
+   uint64_t dxa_l2only_reads = 0, dxa_l2only_dropped = 0, dxa_mc_replay_beats = 0, dxa_mc_transfers = 0;
+   uint64_t dxa_lmem_writes = 0, dxa_transfers = 0;
++  // PhaseShift (patch fdp-lite): FDP-lite epoch counters (summed over sockets; level_last = last socket's level)
++  uint64_t fdp_epochs = 0, fdp_judged = 0, fdp_ups = 0, fdp_downs = 0, fdp_on_ticks = 0, fdp_depth_ticks = 0;
++  uint64_t fdp_level_epochs[5] = {};
++  uint32_t fdp_level_last = 0;
+ };
+ 
+ class Socket : public SimObject<Socket> {

@@ -1,0 +1,598 @@
+diff --git a/VX_types.toml b/VX_types.toml
+index 80ec9c17f..7d9cd3c92 100644
+--- a/VX_types.toml
++++ b/VX_types.toml
+@@ -116,6 +116,40 @@ VX_DCR_KMU_CLUSTER_DIM_Y= 0x022
+ VX_DCR_KMU_CLUSTER_DIM_Z= 0x023
+ VX_DCR_KMU_STATE_END    = 0x024
+ 
++# PhaseShift [dcr_phase] block (ps patch dcr-phase). Lives in the free DCR range 0x024-0x03F
++# (KMU ends at 0x024 exclusive; TEX starts at 0x040); it starts at 0x028, leaving 0x024-0x027 as a guard after the
++# KMU block. SimX latches it into every cache level, the DRAM model and DXA (sim/common/phase_config.h); the
++# latched value survives the per-launch reset. All-zero (the reset value) = stock behaviour. Unknown DCRs are
++# ignored by the base tree (Core::dcr_write), so host code that writes this block also runs there.
++# 64-bit addresses are LO/HI word pairs; ranges are [base, limit).
++[dcr_phase]
++VX_DCR_PHASE_STATE_BEGIN    = 0x028
++VX_DCR_PHASE_MODE           = 0x028  # global mode / phase id (0 = off)
++VX_DCR_PHASE_FLAGS          = 0x029  # bit 0: persist_l2 (VX_PHASE_FLAG_PERSIST_L2)
++VX_DCR_PHASE_L1_WAYMASK     = 0x02A  # L1 dcache allowed ways (0 = all)
++VX_DCR_PHASE_L2_WAYMASK     = 0x02B  # L2 allowed ways (0 = all)
++VX_DCR_PHASE_INSERT_POLICY  = 0x02C  # L2 insertion policy id (0 = stock)
++VX_DCR_PHASE_DXA_DEPTH0     = 0x02D  # DXA depth, classes 0-3, 8 bits each (0 = stock)
++VX_DCR_PHASE_DXA_DEPTH1     = 0x02E  # DXA depth, classes 4-7, 8 bits each (0 = stock)
++VX_DCR_PHASE_DRAM_SCHED     = 0x02F  # DRAM scheduler mode (0 = stock)
++VX_DCR_PHASE_DRAM_AGING     = 0x030  # DRAM aging window, cycles (0 = none)
++VX_DCR_PHASE_KV0_BASE_LO    = 0x031
++VX_DCR_PHASE_KV0_BASE_HI    = 0x032
++VX_DCR_PHASE_KV0_LIMIT_LO   = 0x033
++VX_DCR_PHASE_KV0_LIMIT_HI   = 0x034
++VX_DCR_PHASE_KV1_BASE_LO    = 0x035
++VX_DCR_PHASE_KV1_BASE_HI    = 0x036
++VX_DCR_PHASE_KV1_LIMIT_LO   = 0x037
++VX_DCR_PHASE_KV1_LIMIT_HI   = 0x038
++VX_DCR_PHASE_WGT_BASE_LO    = 0x039
++VX_DCR_PHASE_WGT_BASE_HI    = 0x03A
++VX_DCR_PHASE_WGT_LIMIT_LO   = 0x03B
++VX_DCR_PHASE_WGT_LIMIT_HI   = 0x03C
++VX_DCR_PHASE_STATE_END      = 0x03D
++
++[phase_const]
++VX_PHASE_FLAG_PERSIST_L2    = 0x1
++
+ # DXA descriptor DCR mapping
+ # access pattern:
+ #   VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE + field_off
+diff --git a/sim/common/dram_sim.h b/sim/common/dram_sim.h
+index 565dede37..7222be048 100644
+--- a/sim/common/dram_sim.h
++++ b/sim/common/dram_sim.h
+@@ -14,6 +14,7 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include "phase_config.h"
+ 
+ namespace vortex {
+ 
+@@ -57,9 +58,14 @@ public:
+   // addr: byte address within the channel.
+   void send_request(uint32_t channel, uint64_t addr, bool is_write, ResponseCallback response_cb, void* arg);
+ 
++  // PhaseShift (patch dcr-phase): DCR-latched [dcr_phase] config; reset() leaves it alone.
++  void set_phase_config(const PhaseConfig& cfg) { phase_cfg_ = cfg; }
++  const PhaseConfig& phase_config() const { return phase_cfg_; }
++
+ private:
+   class Impl;
+   Impl* impl_;
++  PhaseConfig phase_cfg_;
+ };
+ 
+ }
+diff --git a/sim/common/phase_config.h b/sim/common/phase_config.h
+new file mode 100644
+index 000000000..2896b1094
+--- /dev/null
++++ b/sim/common/phase_config.h
+@@ -0,0 +1,123 @@
++// PhaseShift patch dcr-phase: the latched [dcr_phase] configuration.
++//
++// The host programs the [dcr_phase] DCR block (VX_types.toml, VX_DCR_PHASE_*) between launches. ProcessorImpl,
++// Cluster and Socket decode every write in that range with PhaseConfig::write() and push the latched copy to each
++// consumer: the L1 icache/dcache clusters (socket), the L2 (cluster), the L3 (processor), the DRAM model (DramSim,
++// through Memory) and, when DXA is built, DxaCore. Every consumer keeps its copy in a member that its on_reset()/
++// reset() does NOT touch, because every launch starts with ProcessorImpl::run() -> reset() ->
++// SimPlatform::instance().reset(); the config written before a launch must still be in force after that reset (the
++// same way the DXA descriptor DCRs survive DxaCore::Impl::reset()).
++//
++// Reset value = all zero = "stock Vortex": with every field 0 no consumer may change its behaviour (no-op regression,
++//). This patch only latches and reports the config; the mechanisms that read it come in later patches.
++//
++// Field semantics (encoding only; each mechanism patch documents its meaning in docs/methodology.md §14):
++//   mode          global PhaseShift mode / phase id (0 = off)
++//   flags         bit 0 VX_PHASE_FLAG_PERSIST_L2 (sensitivity knob; never set by default), other bits reserved
++//   l1_waymask    L1 dcache allowed-way mask (0 = all ways, stock)
++//   l2_waymask    L2 allowed-way mask (0 = all ways, stock)
++//   insert_policy L2 insertion policy id for mechanism D (0 = stock)
++//   dxa_depth[c]  DXA in-flight depth limit for request class c = 0..7 (8 bits each; 0 = stock, unlimited)
++//   dram_sched    DRAM scheduler mode for mechanism B (0 = stock)
++//   dram_aging    DRAM aging window in cycles (0 = none)
++//   kv[0], kv[1]  KV-cache address ranges [base, limit) (limit <= base = empty, the reset value)
++//   wgt           weight address range [base, limit)
++// 64-bit addresses are written as LO/HI 32-bit halves (VX_DCR_DATA_BITS = 32).
++#pragma once
++
++#include <VX_types.h>
++#include <cstdint>
++#include <cstdio>
++#include <functional>
++#include <string>
++
++namespace vortex {
++
++struct PhaseConfig {
++  static constexpr uint32_t NUM_CLASSES = 8;
++
++  struct Range {
++    uint64_t base  = 0;
++    uint64_t limit = 0;
++    bool empty() const { return limit <= base; }
++    bool contains(uint64_t addr) const { return addr >= base && addr < limit; }
++  };
++
++  uint32_t mode          = 0;
++  uint32_t flags         = 0;
++  uint32_t l1_waymask    = 0;
++  uint32_t l2_waymask    = 0;
++  uint32_t insert_policy = 0;
++  uint8_t  dxa_depth[NUM_CLASSES] = {};
++  uint32_t dram_sched    = 0;
++  uint32_t dram_aging    = 0;
++  Range    kv[2];
++  Range    wgt;
++
++  bool persist_l2() const { return (flags & VX_PHASE_FLAG_PERSIST_L2) != 0; }
++
++  static bool is_phase_dcr(uint32_t addr) {
++    return addr >= VX_DCR_PHASE_STATE_BEGIN && addr < VX_DCR_PHASE_STATE_END;
++  }
++
++  // Decode one DCR write. Returns false (and changes nothing) for an address outside the block.
++  bool write(uint32_t addr, uint32_t value) {
++    switch (addr) {
++    case VX_DCR_PHASE_MODE:          mode = value; break;
++    case VX_DCR_PHASE_FLAGS:         flags = value; break;
++    case VX_DCR_PHASE_L1_WAYMASK:    l1_waymask = value; break;
++    case VX_DCR_PHASE_L2_WAYMASK:    l2_waymask = value; break;
++    case VX_DCR_PHASE_INSERT_POLICY: insert_policy = value; break;
++    case VX_DCR_PHASE_DXA_DEPTH0:
++    case VX_DCR_PHASE_DXA_DEPTH1: {
++      uint32_t c0 = (addr - VX_DCR_PHASE_DXA_DEPTH0) * 4;
++      for (uint32_t i = 0; i < 4; ++i)
++        dxa_depth[c0 + i] = uint8_t(value >> (8 * i));
++      break;
++    }
++    case VX_DCR_PHASE_DRAM_SCHED:    dram_sched = value; break;
++    case VX_DCR_PHASE_DRAM_AGING:    dram_aging = value; break;
++    case VX_DCR_PHASE_KV0_BASE_LO:   set_lo(kv[0].base, value); break;
++    case VX_DCR_PHASE_KV0_BASE_HI:   set_hi(kv[0].base, value); break;
++    case VX_DCR_PHASE_KV0_LIMIT_LO:  set_lo(kv[0].limit, value); break;
++    case VX_DCR_PHASE_KV0_LIMIT_HI:  set_hi(kv[0].limit, value); break;
++    case VX_DCR_PHASE_KV1_BASE_LO:   set_lo(kv[1].base, value); break;
++    case VX_DCR_PHASE_KV1_BASE_HI:   set_hi(kv[1].base, value); break;
++    case VX_DCR_PHASE_KV1_LIMIT_LO:  set_lo(kv[1].limit, value); break;
++    case VX_DCR_PHASE_KV1_LIMIT_HI:  set_hi(kv[1].limit, value); break;
++    case VX_DCR_PHASE_WGT_BASE_LO:   set_lo(wgt.base, value); break;
++    case VX_DCR_PHASE_WGT_BASE_HI:   set_hi(wgt.base, value); break;
++    case VX_DCR_PHASE_WGT_LIMIT_LO:  set_lo(wgt.limit, value); break;
++    case VX_DCR_PHASE_WGT_LIMIT_HI:  set_hi(wgt.limit, value); break;
++    default: return false;
++    }
++    return true;
++  }
++
++  // Canonical one-line form. kernels/common/ps_phase.h (host helper) prints the same format from the values it
++  // wrote, and tests/test_ps_phase.py compares the two strings exactly.
++  std::string str() const {
++    char buf[1024];
++    snprintf(buf, sizeof(buf),
++             "mode=0x%x flags=0x%x l1_waymask=0x%x l2_waymask=0x%x insert=0x%x"
++             " dxa_depth=%u,%u,%u,%u,%u,%u,%u,%u dram_sched=0x%x dram_aging=%u"
++             " kv0=0x%llx-0x%llx kv1=0x%llx-0x%llx wgt=0x%llx-0x%llx",
++             mode, flags, l1_waymask, l2_waymask, insert_policy,
++             unsigned(dxa_depth[0]), unsigned(dxa_depth[1]), unsigned(dxa_depth[2]), unsigned(dxa_depth[3]),
++             unsigned(dxa_depth[4]), unsigned(dxa_depth[5]), unsigned(dxa_depth[6]), unsigned(dxa_depth[7]),
++             dram_sched, dram_aging,
++             (unsigned long long)kv[0].base, (unsigned long long)kv[0].limit,
++             (unsigned long long)kv[1].base, (unsigned long long)kv[1].limit,
++             (unsigned long long)wgt.base, (unsigned long long)wgt.limit);
++    return buf;
++  }
++
++private:
++  static void set_lo(uint64_t& f, uint32_t v) { f = (f & ~uint64_t(0xffffffffu)) | v; }
++  static void set_hi(uint64_t& f, uint32_t v) { f = (f & uint64_t(0xffffffffu)) | (uint64_t(v) << 32); }
++};
++
++// Visitor over the consumers holding a latched copy: (consumer name, its copy). Used by PS_DUMP_PHASE.
++using PhaseVisitor = std::function<void(const std::string& consumer, const PhaseConfig& cfg)>;
++
++} // namespace vortex
+diff --git a/sim/simx/cluster.cpp b/sim/simx/cluster.cpp
+index 937c2ae13..39ca6bc90 100644
+--- a/sim/simx/cluster.cpp
++++ b/sim/simx/cluster.cpp
+@@ -420,6 +420,11 @@ public:
+ #endif
+ 
+   int dcr_write(uint32_t addr, uint32_t value) {
++    // PhaseShift (patch dcr-phase): latch [dcr_phase] into the L2, then broadcast to the sockets below.
++    if (PhaseConfig::is_phase_dcr(addr)) {
++      phase_cfg_.write(addr, value);
++      l2cache_->set_phase_config(phase_cfg_);
++    }
+ #ifdef VX_CFG_EXT_OM_ENABLE
+     if (addr >= VX_DCR_OM_STATE_BEGIN && addr < VX_DCR_OM_STATE_END) {
+ #ifdef VX_CFG_EXT_RASTER_ENABLE
+@@ -466,6 +471,12 @@ public:
+     return 0;
+   }
+ 
++  void for_each_phase_consumer(const PhaseVisitor& visit) const {
++    visit(l2cache_->name(), l2cache_->phase_config());
++    for (auto& socket : sockets_)
++      socket->for_each_phase_consumer(visit);
++  }
++
+   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+     for (auto& socket : sockets_) {
+       int ret = socket->dcr_read(addr, tag, value);
+@@ -564,6 +575,7 @@ private:
+   std::vector<Socket::Ptr>    sockets_;
+   std::vector<core_barrier_t> gbarriers_;
+   Cache::Ptr                  l2cache_;
++  PhaseConfig                 phase_cfg_;   // PhaseShift: cluster-level latch of [dcr_phase] (never reset)
+   uint32_t                    cores_per_socket_;
+ #ifdef VX_CFG_VM_ENABLE
+   L2Tlb::Ptr                  l2tlb_;
+@@ -650,6 +662,10 @@ int Cluster::dcr_write(uint32_t addr, uint32_t value) {
+   return impl_->dcr_write(addr, value);
+ }
+ 
++void Cluster::for_each_phase_consumer(const PhaseVisitor& visit) const {
++  impl_->for_each_phase_consumer(visit);
++}
++
+ int Cluster::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+   return impl_->dcr_read(addr, tag, value);
+ }
+diff --git a/sim/simx/cluster.h b/sim/simx/cluster.h
+index 2ff60836b..5d0e5a830 100644
+--- a/sim/simx/cluster.h
++++ b/sim/simx/cluster.h
+@@ -111,6 +111,9 @@ public:
+ 
+   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
+ 
++  // PhaseShift (patch dcr-phase): visit every [dcr_phase] consumer of this cluster (L2, then each socket's).
++  void for_each_phase_consumer(const PhaseVisitor& visit) const;
++
+   class Core* get_core(uint32_t idx) const;
+ 
+   // Cache flush walk. ProcessorImpl ticks in level order (L1 in parallel
+diff --git a/sim/simx/dxa/dxa_core.h b/sim/simx/dxa/dxa_core.h
+index 7f5c1219e..f421d8fd1 100644
+--- a/sim/simx/dxa/dxa_core.h
++++ b/sim/simx/dxa/dxa_core.h
+@@ -16,6 +16,7 @@
+ #include <memory>
+ #include "types.h"
+ #include "dxa_unit.h"
++#include "phase_config.h"
+ 
+ namespace vortex {
+ 
+@@ -82,6 +83,11 @@ public:
+ 
+   const PerfStats& perf_stats() const;
+ 
++  // PhaseShift (patch dcr-phase): DCR-latched [dcr_phase] config (per-class DXA depth lives here). Held outside
++  // Impl; on_reset() never touches it, like the descriptor DCRs.
++  void set_phase_config(const PhaseConfig& cfg) { phase_cfg_ = cfg; }
++  const PhaseConfig& phase_config() const { return phase_cfg_; }
++
+ protected:
+   void on_reset();
+   void on_tick();
+@@ -89,6 +95,7 @@ protected:
+ private:
+   class Impl;
+   Impl* impl_;
++  PhaseConfig phase_cfg_;
+ 
+   friend class SimObject<DxaCore>;
+ };
+diff --git a/sim/simx/mem/cache.h b/sim/simx/mem/cache.h
+index 70ad9e6e3..5a13cde73 100644
+--- a/sim/simx/mem/cache.h
++++ b/sim/simx/mem/cache.h
+@@ -15,6 +15,7 @@
+ 
+ #include "types.h"
+ #include "memory.h"
++#include "phase_config.h"
+ 
+ namespace vortex {
+ 
+@@ -84,6 +85,11 @@ public:
+ 	void flush_begin();
+ 	bool flush_done() const;
+ 
++	// PhaseShift (patch dcr-phase): DCR-latched [dcr_phase] config. Held outside Impl and never touched by
++	// on_reset(), so the value written before a launch is still in force after the launch's reset.
++	void set_phase_config(const PhaseConfig& cfg) { phase_cfg_ = cfg; }
++	const PhaseConfig& phase_config() const { return phase_cfg_; }
++
+ protected:
+ 	void on_reset();
+ 	void on_tick();
+@@ -91,6 +97,7 @@ protected:
+ private:
+ 	class Impl;
+ 	Impl* impl_;
++	PhaseConfig phase_cfg_;
+ 
+ 	friend class SimObject<Cache>;
+ };
+diff --git a/sim/simx/mem/cache_cluster.cpp b/sim/simx/mem/cache_cluster.cpp
+index ff52d56a5..16f67d9c8 100644
+--- a/sim/simx/mem/cache_cluster.cpp
++++ b/sim/simx/mem/cache_cluster.cpp
+@@ -88,6 +88,12 @@ void CacheCluster::flush_begin() {
+ 	}
+ }
+ 
++void CacheCluster::set_phase_config(const PhaseConfig& cfg) {
++	for (auto& cache : caches_) {
++		cache->set_phase_config(cfg);
++	}
++}
++
+ bool CacheCluster::flush_done() const {
+ 	for (auto cache : caches_) {
+ 		if (!cache->flush_done()) return false;
+diff --git a/sim/simx/mem/cache_cluster.h b/sim/simx/mem/cache_cluster.h
+index edbe5958c..8232ec74d 100644
+--- a/sim/simx/mem/cache_cluster.h
++++ b/sim/simx/mem/cache_cluster.h
+@@ -36,6 +36,11 @@ public:
+ 	void flush_begin();
+ 	bool flush_done() const;
+ 
++	// PhaseShift (patch dcr-phase): latch the config into every cache of the cluster; read-only access to the
++	// caches for the PS_DUMP_PHASE report.
++	void set_phase_config(const PhaseConfig& cfg);
++	const std::vector<Cache::Ptr>& caches() const { return caches_; }
++
+ private:
+ 	std::vector<Cache::Ptr> caches_;
+ 
+diff --git a/sim/simx/mem/memory.cpp b/sim/simx/mem/memory.cpp
+index 50db7006a..0b5e857ea 100644
+--- a/sim/simx/mem/memory.cpp
++++ b/sim/simx/mem/memory.cpp
+@@ -164,6 +164,9 @@ public:
+ 	void set_pre_send_hook(Memory::PreSendHook hook) {
+ 		pre_send_hook_ = std::move(hook);
+ 	}
++
++	DramSim& dram_sim() { return dram_sim_; }
++	const DramSim& dram_sim() const { return dram_sim_; }
+ };
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -197,4 +200,12 @@ void Memory::set_pre_send_hook(PreSendHook hook) {
+ 
+ const Memory::PerfStats &Memory::perf_stats() const {
+ 	return impl_->perf_stats();
++}
++
++void Memory::set_phase_config(const PhaseConfig& cfg) {
++	impl_->dram_sim().set_phase_config(cfg);
++}
++
++const PhaseConfig& Memory::phase_config() const {
++	return impl_->dram_sim().phase_config();
+ }
+\ No newline at end of file
+diff --git a/sim/simx/mem/memory.h b/sim/simx/mem/memory.h
+index dd4a95be3..c5fb280bb 100644
+--- a/sim/simx/mem/memory.h
++++ b/sim/simx/mem/memory.h
+@@ -59,6 +59,10 @@ public:
+ 
+ 	const PerfStats& perf_stats() const;
+ 
++	// PhaseShift (patch dcr-phase): forwarded to / read from the DramSim (survives on_reset()).
++	void set_phase_config(const PhaseConfig& cfg);
++	const PhaseConfig& phase_config() const;
++
+ protected:
+ 	void on_reset();
+ 	void on_tick();
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index cc9116cfb..568244620 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -21,6 +21,7 @@
+ #endif
+ 
+ #include <cstdlib>
++#include <cstring>
+ #include <execinfo.h>
+ 
+ using namespace vortex;
+@@ -188,6 +189,13 @@ ProcessorImpl::ProcessorImpl()
+             << ", num_barriers=" << VX_CFG_NUM_BARRIERS
+             << std::endl;
+ #endif
++  // PhaseShift (patch dcr-phase): PS_DUMP_PHASE=1 prints the [dcr_phase] config seen by every consumer at the
++  // first cycle of each launch (debug only; printing does not change simulated timing).
++  {
++    const char* e = std::getenv("PS_DUMP_PHASE");
++    phase_dump_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
++  }
++
+   // reset the device
+   this->reset();
+ }
+@@ -275,11 +283,13 @@ int ProcessorImpl::run() {
+   this->reset();
+   kmu_->start();
+   this->forward_delegated_launch();
++  this->phase_begin_launch();
+ 
+   bool done;
+   int exitcode = 0;
+   do {
+     SimPlatform::instance().tick();
++    this->phase_after_tick();
+     bool any_running = false;
+     for (auto cluster : clusters_) {
+       if (cluster->running()) {
+@@ -345,13 +355,34 @@ bool ProcessorImpl::cycle() {
+     this->reset();
+     kmu_->start();
+     this->forward_delegated_launch();
++    this->phase_begin_launch();
+     is_cycle_initialized_ = true;
+   }
+   SimPlatform::instance().tick();
++  this->phase_after_tick();
+   perf_mem_latency_ += perf_mem_pending_reads_;
+   return this->any_running();
+ }
+ 
++void ProcessorImpl::phase_begin_launch() {
++  ++phase_launches_;
++  phase_dump_pending_ = phase_dump_;
++}
++
++void ProcessorImpl::dump_phase_config() const {
++  // One line per consumer copy: "PSPHASE-DUMP launch=<k> consumer=<name> <PhaseConfig::str()>", k = 0-based launch
++  // index since device open. Parsed by tests/test_ps_phase.py.
++  const uint64_t launch = phase_launches_ - 1;
++  auto visit = [launch](const std::string& name, const PhaseConfig& cfg) {
++    std::cout << "PSPHASE-DUMP launch=" << launch << " consumer=" << name << " " << cfg.str() << std::endl;
++  };
++  visit(l3cache_->name(), l3cache_->phase_config());
++  visit(memsim_->name() + "-dramsim", memsim_->phase_config());
++  for (auto& cluster : clusters_) {
++    cluster->for_each_phase_consumer(visit);
++  }
++}
++
+ int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value) {
+   // KMU DCRs route to the KMU and are not broadcast to cores.
+   bool is_kmu_dcr = (addr >= VX_DCR_KMU_STATE_BEGIN && addr < VX_DCR_KMU_STATE_END);
+@@ -359,6 +390,13 @@ int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value) {
+     kmu_->dcr_write(addr, value);
+     return 0;
+   }
++  // PhaseShift (patch dcr-phase): latch [dcr_phase] into the L3 and the DRAM model here, then broadcast to the
++  // clusters below (L2 -> sockets: L1 caches, DXA -> cores, which ignore it).
++  if (PhaseConfig::is_phase_dcr(addr)) {
++    phase_cfg_.write(addr, value);
++    l3cache_->set_phase_config(phase_cfg_);
++    memsim_->set_phase_config(phase_cfg_);
++  }
+ #ifdef VX_CFG_VM_ENABLE
+   // Device SATP for the shared walker complex, assembled from two
+   // 32-bit halves and fanned out to every cluster on the high write.
+diff --git a/sim/simx/processor_impl.h b/sim/simx/processor_impl.h
+index ebe59cf29..f1ae53fd0 100644
+--- a/sim/simx/processor_impl.h
++++ b/sim/simx/processor_impl.h
+@@ -83,6 +83,17 @@ private:
+   // True once the device walker has latched a page fault.
+   bool mmu_fault_pending() const;
+ 
++  // PhaseShift (patch dcr-phase): start-of-launch bookkeeping and the PS_DUMP_PHASE report (debug only; it prints
++  // the [dcr_phase] config held by every consumer at the first cycle after the launch's reset).
++  void phase_begin_launch();
++  void phase_after_tick() {
++    if (phase_dump_pending_) {
++      phase_dump_pending_ = false;
++      this->dump_phase_config();
++    }
++  }
++  void dump_phase_config() const;
++
+   Kmu::Ptr    kmu_;
+   std::vector<Cluster::Ptr> clusters_;
+   Memory::Ptr memsim_;
+@@ -103,6 +114,12 @@ private:
+   // kmu_->start()). reset() clears it so a back-to-back kernel launch
+   // via cycle() re-dispatches the KMU.
+   bool is_cycle_initialized_;
++  // PhaseShift (patch dcr-phase): processor-level latch of [dcr_phase] (feeds L3 and DRAM; never reset), launch
++  // counter and the PS_DUMP_PHASE switch (read once at construction).
++  PhaseConfig phase_cfg_;
++  uint64_t    phase_launches_ = 0;
++  bool        phase_dump_ = false;
++  bool        phase_dump_pending_ = false;
+ };
+ 
+ }
+diff --git a/sim/simx/socket.cpp b/sim/simx/socket.cpp
+index 73f8bd062..ba44a8507 100644
+--- a/sim/simx/socket.cpp
++++ b/sim/simx/socket.cpp
+@@ -381,6 +381,16 @@ public:
+   }
+ 
+   int dcr_write(uint32_t addr, uint32_t value) {
++    // PhaseShift (patch dcr-phase): latch [dcr_phase] into the L1 caches and DXA, then fall through to the cores
++    // (Core::dcr_write ignores it), as every other broadcast DCR.
++    if (PhaseConfig::is_phase_dcr(addr)) {
++      phase_cfg_.write(addr, value);
++      icaches_->set_phase_config(phase_cfg_);
++      dcaches_->set_phase_config(phase_cfg_);
++#ifdef VX_CFG_EXT_DXA_ENABLE
++      dxa_core_->set_phase_config(phase_cfg_);
++#endif
++    }
+ #ifdef VX_CFG_EXT_DXA_ENABLE
+     if (addr >= VX_DCR_DXA_STATE_BEGIN && addr < VX_DCR_DXA_STATE_END) {
+       return dxa_core_->dcr_write(addr, value);
+@@ -399,6 +409,16 @@ public:
+     return 0;
+   }
+ 
++  void for_each_phase_consumer(const PhaseVisitor& visit) const {
++    for (auto& cache : icaches_->caches())
++      visit(cache->name(), cache->phase_config());
++    for (auto& cache : dcaches_->caches())
++      visit(cache->name(), cache->phase_config());
++#ifdef VX_CFG_EXT_DXA_ENABLE
++    visit(dxa_core_->name(), dxa_core_->phase_config());
++#endif
++  }
++
+   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+     for (auto& core : cores_) {
+       uint16_t core_id = tag & 0xfffff;
+@@ -443,6 +463,7 @@ private:
+   uint32_t                domain_id_;
+   CacheCluster::Ptr       icaches_;
+   CacheCluster::Ptr       dcaches_;
++  PhaseConfig             phase_cfg_;   // PhaseShift: socket-level latch of [dcr_phase] (never reset)
+ #ifdef VX_CFG_EXT_DXA_ENABLE
+   DxaCore::Ptr            dxa_core_;
+ #endif
+@@ -500,6 +521,10 @@ int Socket::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
+   return impl_->dcr_read(addr, tag, value);
+ }
+ 
++void Socket::for_each_phase_consumer(const PhaseVisitor& visit) const {
++  impl_->for_each_phase_consumer(visit);
++}
++
+ Core::Ptr& Socket::core(uint32_t idx) {
+   return impl_->core(idx);
+ }
+diff --git a/sim/simx/socket.h b/sim/simx/socket.h
+index f0d91a060..6d23f80af 100644
+--- a/sim/simx/socket.h
++++ b/sim/simx/socket.h
+@@ -72,6 +72,9 @@ public:
+ 
+   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
+ 
++  // PhaseShift (patch dcr-phase): visit every [dcr_phase] consumer of this socket (L1 caches, DXA).
++  void for_each_phase_consumer(const PhaseVisitor& visit) const;
++
+   std::shared_ptr<Core>& core(uint32_t idx);
+ 
+   // Forwarded cache flush (write-back eviction walk). The walk is a no-op

@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# install_kernel_apps.sh -- generate the build-dir Makefiles of the PhaseShift out-of-tree Vortex apps.
+#
+# Why: tests/regression/common.mk:1 fixes ROOT_DIR := $(realpath ../../..) of the app directory (errata 8), so an
+# app must live at <build>/tests/regression/<app>/ even though its sources stay in $PS/kernels/. For every
+# $PS/kernels/<dir>/ that contains a main.cpp, this script writes
+#     <build>/tests/regression/<app>/Makefile        app = <dir> if <dir> starts with ps_, else ps_<dir>
+# for each build dir (default: build/vortex-base and build/vortex-ps, those that exist). The Makefile mirrors
+# tests/regression/sgemv/Makefile line for line (ROOT_DIR, include config.mk, PROJECT, SRC_DIR, SRCS, VX_SRCS, OPTS,
+# KERNEL_LIB, include ../common.mk) with SRC_DIR := $(PS_KERNELS)/<dir> (PS_KERNELS = absolute $PS/kernels), plus
+# five added lines:
+#   * CXXFLAGS / VX_CFLAGS += -I$(PS_KERNELS)/common for host and device compiles (ps_common.h, ps_fixture.h);
+#   * VX_CFLAGS += -fno-math-errno (errata 30): the clang driver defaults to -fmath-errno for
+#     riscv32-unknown-elf, and under it the front end emits __builtin_fmaf / fmaf as a CALL to musl's fmaf
+#     (`fmadd.s; ret`) instead of llvm.fma (inline fmadd.s). The flag only drops the errno contract of libm calls; it
+#     enables no value-changing optimisation (no fast-math flag), and musl never sets errno for fmaf/sqrtf on this
+#     target anyway. Measured effect over every ps_* kernel: fmaf calls 251 -> 0 (decode_attn_gqa), 30 -> 0
+#     (softmax_fixed); rmsnorm loses the never-taken `call sqrtf` errno fallback after its inline fsqrt.s; rope has one
+#     commuted fmul.s; every other kernel's assembly is identical; all outputs are bit-identical (results/<run>);
+#   * HDRS / VX_HDRS = every *.h of the app dir and kernels/common (common.mk's documented hook: header edits then
+#     rebuild the app; common.mk filters them out of the compiler inputs).
+# OPTS / KERNEL_LIB come from an optional per-app $PS/kernels/<dir>/app.conf (`OPTS=...` / `KERNEL_LIB=...` lines;
+# defaults: empty OPTS, vortex2). Two kernel dirs mapping to the same app name (foo and ps_foo) are an error.
+# Two more optional app.conf keys (multi-kernel apps such as ps_llama; an app without them gets exactly the
+# Makefile it got before): `VX_SRCS=a.cpp b.cpp ...` (device sources relative to SRC_DIR, replacing the default
+# kernel.cpp; tests/regression/common.mk compiles each to <basename>.o and links them into one kernel.elf / .vxbin,
+# the multi-entry module of tests/regression/multikernel) and `DEPS=pattern ...` (make wildcards relative to SRC_DIR,
+# appended to HDRS and VX_HDRS, so edits to sources a device file #includes rebuild the app).
+# Nothing is written into third_party/ or vortex-trees/; nothing is built. Idempotent: a Makefile is rewritten only
+# when its content changes (so its mtime, and vxrun's app-source hash, stay stable).
+#
+# Usage: scripts/install_kernel_apps.sh [--check] [build_dir ...]
+#   --check   write nothing; exit 1 if any Makefile is missing or differs from what would be generated
+set -euo pipefail
+
+PS="${PS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+KDIR="$PS/kernels"
+check=0
+builds=()
+for a in "$@"; do
+  case "$a" in
+    --check) check=1 ;;
+    -h|--help) sed -n '2,34p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) builds+=("$a") ;;
+  esac
+done
+if [ ${#builds[@]} -eq 0 ]; then
+  for t in base ps; do
+    [ -f "$PS/build/vortex-$t/tests/regression/common.mk" ] && builds+=("$PS/build/vortex-$t")
+  done
+fi
+[ ${#builds[@]} -gt 0 ] || { echo "install_kernel_apps: no build dir with tests/regression/common.mk" >&2; exit 1; }
+
+gen_makefile() {   # $1 = kernel dir name, $2 = app name
+  local dir="$1" app="$2" src="$KDIR/$1" opts="" klib="vortex2" line key val vxsrcs="" deps="" f
+  local vxsrcs_line='$(SRC_DIR)/kernel.cpp' deps_lines=""
+  if [ -f "$src/app.conf" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|'#'*) continue ;; esac
+      key="${line%%=*}"; val="${line#*=}"
+      case "$key" in
+        OPTS) opts="$val" ;;
+        KERNEL_LIB) klib="$val" ;;
+        VX_SRCS) vxsrcs="$val" ;;
+        DEPS) deps="$val" ;;
+        *) echo "install_kernel_apps: $src/app.conf: unknown key '$key'" >&2; return 1 ;;
+      esac
+    done < "$src/app.conf"
+  fi
+  set -f   # VX_SRCS / DEPS are split on spaces but never glob-expanded here (DEPS patterns are make wildcards)
+  if [ -n "$vxsrcs" ]; then
+    vxsrcs_line=""
+    for f in $vxsrcs; do
+      [ -e "$src/$f" ] || { echo "install_kernel_apps: $src/app.conf: VX_SRCS file '$f' missing" >&2; return 1; }
+      vxsrcs_line="${vxsrcs_line:+$vxsrcs_line }\$(SRC_DIR)/$f"
+    done
+  fi
+  if [ -n "$deps" ]; then
+    val=""
+    for f in $deps; do val="${val:+$val }\$(wildcard \$(SRC_DIR)/$f)"; done
+    deps_lines="HDRS += $val"$'\n'"VX_HDRS += $val"
+  fi
+  set +f
+  cat <<EOF
+# GENERATED by scripts/install_kernel_apps.sh (PhaseShift) -- do not edit; re-run the installer.
+# Mirrors tests/regression/sgemv/Makefile; the sources live out of tree in \$(PS_KERNELS)/$dir.
+ROOT_DIR := \$(realpath ../../..)
+include \$(ROOT_DIR)/config.mk
+
+PROJECT := $app
+
+PS_KERNELS := $KDIR
+SRC_DIR := \$(PS_KERNELS)/$dir
+
+SRCS := \$(SRC_DIR)/main.cpp
+
+VX_SRCS := $vxsrcs_line
+
+OPTS ?= $opts
+
+KERNEL_LIB := $klib
+
+# PhaseShift additions: shared host headers, inline libm builtins (-fno-math-errno: __builtin_fmaf is fmadd.s, not a
+# call to fmaf; errata 30), and header prerequisites (common.mk filters them out of the compile).
+CXXFLAGS += -I\$(PS_KERNELS)/common
+VX_CFLAGS += -I\$(PS_KERNELS)/common
+VX_CFLAGS += -fno-math-errno
+HDRS := \$(wildcard \$(SRC_DIR)/*.h) \$(wildcard \$(PS_KERNELS)/common/*.h)
+VX_HDRS := \$(wildcard \$(SRC_DIR)/*.h) \$(wildcard \$(PS_KERNELS)/common/*.h)
+${deps_lines:+$deps_lines
+}
+include ../common.mk
+EOF
+}
+
+# app-name collisions: kernels/foo and kernels/ps_foo would both become app ps_foo
+declare -A seen=()
+for main in "$KDIR"/*/main.cpp; do
+  [ -e "$main" ] || continue
+  d="$(basename "$(dirname "$main")")"
+  case "$d" in ps_*) app="$d" ;; *) app="ps_$d" ;; esac
+  if [ -n "${seen[$app]:-}" ]; then
+    echo "install_kernel_apps: app name collision: kernels/${seen[$app]} and kernels/$d both map to $app" >&2
+    exit 1
+  fi
+  seen[$app]="$d"
+done
+
+status=0
+for b in "${builds[@]}"; do
+  reg="$b/tests/regression"
+  [ -f "$reg/common.mk" ] || { echo "install_kernel_apps: $reg/common.mk missing" >&2; exit 1; }
+  for main in "$KDIR"/*/main.cpp; do
+    [ -e "$main" ] || continue
+    d="$(basename "$(dirname "$main")")"
+    [ -e "$KDIR/$d/kernel.cpp" ] || { echo "install_kernel_apps: $KDIR/$d has main.cpp but no kernel.cpp" >&2; exit 1; }
+    case "$d" in ps_*) app="$d" ;; *) app="ps_$d" ;; esac
+    out="$reg/$app/Makefile"
+    new="$(gen_makefile "$d" "$app")"
+    if [ -f "$out" ] && [ "$(cat "$out")" == "$new" ]; then
+      echo "install_kernel_apps: $out up to date"
+      continue
+    fi
+    if [ $check -eq 1 ]; then
+      echo "install_kernel_apps: $out missing or stale" >&2
+      status=1
+      continue
+    fi
+    mkdir -p "$reg/$app"
+    printf '%s\n' "$new" > "$out.tmp.$$"
+    mv -f "$out.tmp.$$" "$out"
+    echo "install_kernel_apps: wrote $out"
+  done
+done
+
+# Final verification pass. Every build-dir Makefile must now equal the generated text
+# byte for byte (cmp), otherwise exit 1: a stale generated Makefile gives a silent vx_module_get_kernel=3 at run time.
+if [ $check -eq 0 ]; then
+  for b in "${builds[@]}"; do
+    for main in "$KDIR"/*/main.cpp; do
+      [ -e "$main" ] || continue
+      d="$(basename "$(dirname "$main")")"
+      case "$d" in ps_*) app="$d" ;; *) app="ps_$d" ;; esac
+      out="$b/tests/regression/$app/Makefile"
+      if ! cmp -s "$out" <(printf '%s\n' "$(gen_makefile "$d" "$app")"); then
+        echo "install_kernel_apps: VERIFY FAILED: $out differs from the generated text after install" >&2
+        status=1
+      fi
+    done
+  done
+fi
+exit $status

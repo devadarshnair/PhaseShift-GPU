@@ -1,0 +1,374 @@
+diff --git a/sim/simx/dxa/dxa_core.cpp b/sim/simx/dxa/dxa_core.cpp
+index 548a24831..54efa5da0 100644
+--- a/sim/simx/dxa/dxa_core.cpp
++++ b/sim/simx/dxa/dxa_core.cpp
+@@ -45,6 +45,13 @@ constexpr uint64_t kGmemLineMask = ~uint64_t(VX_CFG_L1_LINE_SIZE - 1);
+ // Cores served by one (socket-resident) DXA engine.
+ constexpr uint32_t kCoresPerSocket = VX_CFG_SOCKET_SIZE;
+ 
++// PhaseShift (patch dxa-class): the per-stream fields sit directly above the stock META fields (dxa_meta.h).
++static_assert(DXA_DESC_META_PS_CLASS_LSB == DXA_DESC_META_L2PROMO_LSB + DXA_DESC_META_L2PROMO_BITS,
++              "dxa-class: PS_CLASS must start right after the last stock META field");
++static_assert((1u << DXA_DESC_META_PS_CLASS_BITS) == VX_PS_NUM_CLASSES, "dxa-class: PS_CLASS width = class width");
++static_assert(DXA_DESC_META_PS_L2ONLY_LSB == DXA_DESC_META_PS_CLASS_LSB + DXA_DESC_META_PS_CLASS_BITS,
++              "dxa-class: PS_L2ONLY follows PS_CLASS");
++
+ } // namespace
+ 
+ // ════════════════════════════════════════════════════════════════════
+@@ -122,6 +129,10 @@ public:
+     uint32_t                mc_cta_idx = 0;      // 0..cta_indices.size()
+     uint32_t                km_elem_idx = 0;     // 0..km_num_elems (K-major scatter)
+     uint32_t                writes_emitted = 0;  // count for perf
++
++    // PhaseShift (patch dxa-class): the transfer's stream class (META 15:13, unset = BULK_DXA) and L2-only bit.
++    uint32_t                ps_cls = VX_PS_CLASS_BULK_DXA;
++    bool                    ps_l2only = false;
+   };
+ 
+   // ── Constructor ──────────────────────────────────────────────────────
+@@ -218,10 +229,23 @@ public:
+         uint32_t slot_id = uint32_t(rsp.tag) & (VX_CFG_DXA_MAX_INFLIGHT - 1);
+         auto& w = workers_[worker_id];
+         if (slot_id < w.inflight.size() && w.inflight[slot_id].allocated) {
+-          if (!w.inflight[slot_id].rsp_arrived)
++          if (!w.inflight[slot_id].rsp_arrived) {
+             simobject_->ps_dxa_response(worker_id);   // PhaseShift (patch ps-counters): a real GMEM read returned
+-          w.inflight[slot_id].rsp_arrived = true;
+-          w.inflight[slot_id].rsp_data    = rsp.data;
++            simobject_->ps_cls_response(w.ps_cls);    // PhaseShift (patch dxa-class)
++          }
++          if (w.ps_l2only) {
++            // PhaseShift (patch dxa-class): L2-prefetch-only. The line is in the L2 now (the read allocated it on
++            // its way); the response is dropped here and the slot freed, no LMEM write is built.
++            ++simobject_->ps_cls.l2only_dropped;
++            w.inflight[slot_id].allocated = false;
++            w.inflight[slot_id].rsp_arrived = false;
++            w.inflight[slot_id].rsp_data.reset();
++            auto it = std::find(w.issued_order.begin(), w.issued_order.end(), slot_id);
++            if (it != w.issued_order.end()) w.issued_order.erase(it);
++          } else {
++            w.inflight[slot_id].rsp_arrived = true;
++            w.inflight[slot_id].rsp_data    = rsp.data;
++          }
+         }
+         ch.pop();
+       }
+@@ -255,6 +279,15 @@ private:
+     return (r == 0) ? 1u : std::min(r, 5u);
+   }
+ 
++  // PhaseShift (patch dxa-class, methodology §14.C): stream class and L2-prefetch-only bit of a descriptor.
++  static uint32_t desc_ps_class(uint32_t meta) {
++    uint32_t c = (meta >> DXA_DESC_META_PS_CLASS_LSB) & ((1u << DXA_DESC_META_PS_CLASS_BITS) - 1u);
++    return (c == 0) ? uint32_t(VX_PS_CLASS_BULK_DXA) : c;
++  }
++  static bool desc_ps_l2only(uint32_t meta) {
++    return ((meta >> DXA_DESC_META_PS_L2ONLY_LSB) & ((1u << DXA_DESC_META_PS_L2ONLY_BITS) - 1u)) != 0;
++  }
++
+   static uint32_t desc_elem_bytes(uint32_t meta) {
+     uint32_t enc = (meta >> DXA_DESC_META_ELEMSZ_LSB)
+                     & ((1u << DXA_DESC_META_ELEMSZ_BITS) - 1u);
+@@ -367,6 +400,9 @@ private:
+ 
+     w.desc = descriptors_.at(req.desc_slot);
+     w.smem_stride = w.desc.smem_stride;
++    w.ps_cls    = desc_ps_class(w.desc.meta);    // PhaseShift (patch dxa-class)
++    w.ps_l2only = desc_ps_l2only(w.desc.meta);
++    if (w.is_multicast && !w.ps_l2only) ++simobject_->ps_cls.mc_transfers;
+ 
+     enumerate_work_list(w);
+     if (w.work_list.empty()) {
+@@ -565,6 +601,11 @@ private:
+ 
+     // OOB lines skip the GMEM request entirely; we synthesize an immediate
+     // arrival (rsp data left null — smem_wr will use cfill).
++    if (lw.oob && w.ps_l2only) {
++      // PhaseShift (patch dxa-class): an L2-only transfer has nothing to fetch for an out-of-range line.
++      ++w.ag_idx;
++      return;
++    }
+     if (lw.oob) {
+       w.inflight[slot].allocated   = true;
+       w.inflight[slot].rsp_arrived = true;
+@@ -575,6 +616,15 @@ private:
+       return;
+     }
+ 
++    // PhaseShift (patch dxa-class, methodology §14.C): per-class in-flight cap at work-list dispatch. dxa_depth[c] of
++    // the latched [dcr_phase] config (0 = stock, no cap) bounds the GMEM reads of class c in flight in this DxaCore
++    // (all its workers); the AGU holds the next read until one returns. Read live, so a PS_SCHEDULE segment change
++    // applies from the next issue on.
++    if (simobject_->ps_cls_capped(w.ps_cls)) {
++      simobject_->ps_cls_stall(w.ps_cls);
++      return;
++    }
++
+     // Issue real GMEM read. Tag = per-worker slot id (gmem_arb_ prepends
+     // its own input-index bits for response routing — we only see slot
+     // bits coming back).
+@@ -583,14 +633,17 @@ private:
+     mreq.tag   = slot;
+     mreq.hart_id   = w.req.core->id();
+     mreq.uuid  = w.req.uuid;
+-    // PhaseShift (patch mem-class): every DXA GMEM read is BULK_DXA, tagged where it is built (errata 13); the LMEM
+-    // write below (smem_wr) is left alone. Per-stream classes come with mechanism C.
+-    mreq.flags.mem_class = VX_PS_CLASS_BULK_DXA;
++    // PhaseShift (patch mem-class): DXA GMEM reads are tagged where they are built (errata 13); the LMEM write below
++    // (smem_wr) is left alone. Patch dxa-class: the tag is the descriptor's stream class (unset = BULK_DXA, the
++    // mem-class behaviour), so the caches and mechanism B's DRAM controller see it.
++    mreq.flags.mem_class = w.ps_cls;
+ 
+     auto& ch = gmem_arb_->ReqIn.at(w.worker_id);
+     if (!ch.try_send(mreq)) return; // arb backpressure
+     simobject_->ps_count_gmem(mreq.flags.mem_class);
+     simobject_->ps_dxa_issue(w.worker_id);   // PhaseShift (patch ps-counters)
++    simobject_->ps_cls_issue(w.ps_cls);      // PhaseShift (patch dxa-class)
++    if (w.ps_l2only) ++simobject_->ps_cls.l2only_reads;
+ 
+     w.inflight[slot].allocated   = true;
+     w.inflight[slot].rsp_arrived = false;
+@@ -604,7 +657,12 @@ private:
+   void tick_worker_smem_wr(Worker& w) {
+     if (w.issued_order.empty()) {
+       // Nothing in flight — if all addr_gen done, transfer is finished.
+-      if (w.ag_idx == w.work_list.size()) finish_worker(w);
++      if (w.ag_idx == w.work_list.size()) {
++        // PhaseShift (patch dxa-class): an L2-only transfer writes no LMEM byte, so no write carries notify_done;
++        // its barrier(s) are released here, once the last read has returned (the same release as an empty transfer).
++        if (w.ps_l2only) release_all_barriers(w);
++        finish_worker(w);
++      }
+       return;
+     }
+ 
+@@ -770,6 +828,8 @@ private:
+ 
+       lmem_ch.send(req);
+       ++w.writes_emitted;
++      if (w.is_multicast && w.mc_cta_idx > 0 && 0 == emitted)
++        ++simobject_->ps_cls.mc_replay_beats;   // PhaseShift (patch dxa-class): serial-multicast replay beat
+       // Count write transactions, not port requests: one per banked-row beat.
+       // A beat spans LMEM_PORTS_PER_CORE ports of the same row, so only its
+       // first emission is counted.
+@@ -882,6 +942,13 @@ void DxaCore::on_reset() {
+   impl_->reset();
+   // PhaseShift (patch ps-counters): the reset drops every in-flight slot; bytes and maxima are cumulative.
+   for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s) ps_dxa_inflight_[s] = 0;
++  for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) ps_cls_inflight_[c] = 0;   // PhaseShift (patch dxa-class)
++}
++
++void DxaCore::ps_cls_issue(uint32_t cls) {
++  cls &= VX_PS_NUM_CLASSES - 1;
++  const uint64_t n = ++ps_cls_inflight_[cls];
++  ps_cls.max_inflight[cls] = std::max(ps_cls.max_inflight[cls], n);
+ }
+ 
+ void DxaCore::ps_dxa_issue(uint32_t worker) {
+diff --git a/sim/simx/dxa/dxa_core.h b/sim/simx/dxa/dxa_core.h
+index 881017aed..980a698ea 100644
+--- a/sim/simx/dxa/dxa_core.h
++++ b/sim/simx/dxa/dxa_core.h
+@@ -107,6 +107,29 @@ public:
+     for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s) ps_dxa_max_win_[s] = ps_dxa_inflight_[s];
+   }
+ 
++  // PhaseShift (patch dxa-class, docs/methodology.md §14.C): per request class c (the stream class of
++  // the descriptor, META bits 15:13; unset = BULK_DXA): GMEM reads issued, reads in flight now and their maximum
++  // since construction (the cap dxa_depth[c] of [dcr_phase] bounds this count, at work-list dispatch), issue cycles
++  // the cap held a read back; L2-prefetch-only reads issued / responses dropped; multicast replay beats (LMEM write
++  // beats for the 2nd..n-th receiver of a multicast transfer, the serial-multicast cost). Observation only.
++  void ps_cls_issue(uint32_t cls);
++  void ps_cls_response(uint32_t cls) {
++    cls &= VX_PS_NUM_CLASSES - 1;
++    if (ps_cls_inflight_[cls] != 0) --ps_cls_inflight_[cls];
++  }
++  uint32_t ps_cls_cap(uint32_t cls) const { return phase_cfg_.dxa_depth[cls & (VX_PS_NUM_CLASSES - 1)]; }
++  bool ps_cls_capped(uint32_t cls) const {
++    const uint32_t cap = ps_cls_cap(cls);
++    return cap != 0 && ps_cls_inflight_[cls & (VX_PS_NUM_CLASSES - 1)] >= cap;
++  }
++  void ps_cls_stall(uint32_t cls) { ++ps_cls.cap_stalls[cls & (VX_PS_NUM_CLASSES - 1)]; }
++  struct PsClsStats {
++    uint64_t max_inflight[VX_PS_NUM_CLASSES] = {};
++    uint64_t cap_stalls[VX_PS_NUM_CLASSES] = {};
++    uint64_t l2only_reads = 0, l2only_dropped = 0, mc_replay_beats = 0, mc_transfers = 0;
++  };
++  PsClsStats ps_cls;   // counters (maxima + sums), written by Impl
++
+ protected:
+   void on_reset();
+   void on_tick();
+@@ -120,6 +143,7 @@ private:
+   uint64_t ps_dxa_inflight_[VX_PS_DXA_STREAMS] = {};
+   uint64_t ps_dxa_max_tot_[VX_PS_DXA_STREAMS] = {};
+   uint64_t ps_dxa_max_win_[VX_PS_DXA_STREAMS] = {};
++  uint64_t ps_cls_inflight_[VX_PS_NUM_CLASSES] = {};    // PhaseShift (patch dxa-class)
+ 
+   friend class SimObject<DxaCore>;
+ };
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index f3c92cfb0..5ffe52c6e 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -203,6 +203,12 @@ ProcessorImpl::ProcessorImpl()
+     const char* e = std::getenv("PS_DRAM_REPORT");
+     ps_dram_report_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
+   }
++  // PhaseShift (patch dxa-class): PS_DXA_REPORT=1 prints one PSDXAC line (per-class DXA counters, methodology §14.C)
++  // at the end of every launch (printing does not change timing).
++  {
++    const char* e = std::getenv("PS_DXA_REPORT");
++    ps_dxa_report_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
++  }
+   // PhaseShift (patch b-baselines): PS_PADC_TRACE=1 prints one PSPADCEP line per PADC-lite epoch (TEST trace).
+   {
+     const char* e = std::getenv("PS_PADC_TRACE");
+@@ -372,9 +378,34 @@ int ProcessorImpl::run() {
+     this->ps_class_report("end");
+   if (ps_dram_report_)
+     memsim_->ps_dram_report(phase_launches_ - 1);
++  if (ps_dxa_report_)
++    this->ps_dxa_report();
+   return exitcode;
+ }
+ 
++void ProcessorImpl::ps_dxa_report() const {
++  // PhaseShift (patch dxa-class) PS_DXA_REPORT line; cumulative since device open (one launch per app run here).
++  PsClassCollect col;
++  for (auto& cluster : clusters_)
++    cluster->ps_collect(col);
++  auto list = [](const uint64_t* v, uint32_t n) {
++    std::string out;
++    for (uint32_t i = 0; i < n; ++i) {
++      if (i) out += ",";
++      out += std::to_string(v[i]);
++    }
++    return out;
++  };
++  std::cout << "PSDXAC launch=" << (phase_launches_ ? phase_launches_ - 1 : 0)
++            << " gmem_reqs=" << list(col.dxa_gmem, VX_PS_NUM_CLASSES)
++            << " max_inflight=" << list(col.dxa_cls_max_inflight, VX_PS_NUM_CLASSES)
++            << " cap_stalls=" << list(col.dxa_cls_cap_stalls, VX_PS_NUM_CLASSES)
++            << " l2only_reads=" << col.dxa_l2only_reads << " l2only_dropped=" << col.dxa_l2only_dropped
++            << " lmem_writes=" << col.dxa_lmem_writes << " transfers=" << col.dxa_transfers
++            << " mc_transfers=" << col.dxa_mc_transfers << " mc_replay_beats=" << col.dxa_mc_replay_beats
++            << std::endl;
++}
++
+ void ProcessorImpl::ps_class_report(const char* when) const {
+   // PhaseShift (patch mem-class) PS_DEBUG_CLASS report; parsed by scripts/psclass.py. All counters are cumulative since
+   // device open except the ps_mark counts, which are per launch. Byte counts: one DRAM request = one block.
+diff --git a/sim/simx/processor_impl.h b/sim/simx/processor_impl.h
+index 522248e65..8ce8326c6 100644
+--- a/sim/simx/processor_impl.h
++++ b/sim/simx/processor_impl.h
+@@ -107,6 +107,7 @@ private:
+   void dump_phase_config() const;
+   // PhaseShift (patch mem-class): PS_DEBUG_CLASS report (when = "end" of a launch or "flush").
+   void ps_class_report(const char* when) const;
++  void ps_dxa_report() const;   // PhaseShift (patch dxa-class)
+ 
+   // PhaseShift (patch ps-counters): one simulated cycle (= SimPlatform tick + the cumulative tick count the trace
+   // uses), and the work-unit interval trace hooks (PS_TRACE; methodology §12.10). Observation only.
+@@ -178,6 +179,7 @@ private:
+   bool        phase_dump_ = false;
+   bool        phase_dump_pending_ = false;
+   bool        ps_dram_report_ = false;   // PhaseShift (patch dram-2class): PS_DRAM_REPORT (read once at construction)
++  bool        ps_dxa_report_ = false;    // PhaseShift (patch dxa-class): PS_DXA_REPORT (read once at construction)
+   bool        ps_debug_class_ = false;   // PhaseShift (patch mem-class): PS_DEBUG_CLASS (read once at construction)
+   // PhaseShift (patch ps-counters)
+   std::unique_ptr<PsTrace> ps_trace_;      // PS_TRACE (read once at construction); null = no trace
+diff --git a/sim/simx/socket.cpp b/sim/simx/socket.cpp
+index 163a2fd5d..760e799d7 100644
+--- a/sim/simx/socket.cpp
++++ b/sim/simx/socket.cpp
+@@ -432,6 +432,19 @@ public:
+       out.dxa_bytes[s] += dxa_core_->ps_dxa_bytes(s);
+       out.dxa_max_inflight[s] = std::max(out.dxa_max_inflight[s], dxa_core_->ps_dxa_max_inflight(s, out.dxa_window));
+     }
++    {   // PhaseShift (patch dxa-class)
++      const auto& pc = dxa_core_->ps_cls;
++      for (uint32_t c = 0; c < VX_PS_NUM_CLASSES; ++c) {
++        out.dxa_cls_max_inflight[c] = std::max(out.dxa_cls_max_inflight[c], pc.max_inflight[c]);
++        out.dxa_cls_cap_stalls[c] += pc.cap_stalls[c];
++      }
++      out.dxa_l2only_reads += pc.l2only_reads;
++      out.dxa_l2only_dropped += pc.l2only_dropped;
++      out.dxa_mc_replay_beats += pc.mc_replay_beats;
++      out.dxa_mc_transfers += pc.mc_transfers;
++      out.dxa_lmem_writes += dxa_core_->perf_stats().lmem_writes;
++      out.dxa_transfers += dxa_core_->perf_stats().transfers;
++    }
+ #endif
+     for (auto& core : cores_) {
+       std::array<uint64_t, VX_PS_NUM_MARK_TYPES> m{};
+diff --git a/sim/simx/socket.h b/sim/simx/socket.h
+index 2dd3b6e11..b73d1d727 100644
+--- a/sim/simx/socket.h
++++ b/sim/simx/socket.h
+@@ -42,6 +42,12 @@ struct PsClassCollect {
+   uint64_t dxa_bytes[VX_PS_DXA_STREAMS] = {};
+   uint64_t dxa_max_inflight[VX_PS_DXA_STREAMS] = {};
+   bool     dxa_window = false;   // input: read the max-in-flight windows instead of the since-construction maxima
++  // PhaseShift (patch dxa-class): per-class DXA counters (max in flight = max over sockets, the rest summed) and the
++  // stock DXA LMEM write-beat count (summed), for the PS_DXA_REPORT line.
++  uint64_t dxa_cls_max_inflight[VX_PS_NUM_CLASSES] = {};
++  uint64_t dxa_cls_cap_stalls[VX_PS_NUM_CLASSES] = {};
++  uint64_t dxa_l2only_reads = 0, dxa_l2only_dropped = 0, dxa_mc_replay_beats = 0, dxa_mc_transfers = 0;
++  uint64_t dxa_lmem_writes = 0, dxa_transfers = 0;
+ };
+ 
+ class Socket : public SimObject<Socket> {
+diff --git a/sw/common/dxa_meta.h b/sw/common/dxa_meta.h
+index 7dbc16b84..078ddf0ea 100644
+--- a/sw/common/dxa_meta.h
++++ b/sw/common/dxa_meta.h
+@@ -31,3 +31,18 @@
+ #define DXA_DESC_META_SWIZZLE_LSB    (DXA_DESC_META_LAYOUT_LSB + DXA_DESC_META_LAYOUT_BITS)
+ #define DXA_DESC_META_INTERLEAVE_LSB (DXA_DESC_META_SWIZZLE_LSB + DXA_DESC_META_SWIZZLE_BITS)
+ #define DXA_DESC_META_L2PROMO_LSB    (DXA_DESC_META_INTERLEAVE_LSB + DXA_DESC_META_INTERLEAVE_BITS)
++
++// PhaseShift (patch dxa-class, docs/methodology.md §14.C): per-stream fields in META bits that the stock
++// encoder never sets. The stock fields above occupy bits 0..12 (DXA_DESC_META_TOTAL_BITS = 13 in VX_dxa_pkg.sv); the
++// META DCR word is 32 bits wide (VX_DCR_DATA_BITS). Neither the RTL (VX_dxa_setup.sv reads only DIM, ELEMSZ and
++// LAYOUT) nor stock SimX reads bits 13..31, so a descriptor with these bits clear behaves exactly as before.
++//   bits 15:13  PS_CLASS   request class (VX_PS_CLASS_*) carried by every GMEM read of the stream; 0 = unset, which
++//                          keeps the stock tag BULK_DXA (so a stream cannot be tagged ORDINARY on purpose)
++//   bit  16     PS_L2ONLY  L2-prefetch-only: the GMEM reads are issued (and fill the L2), the responses are dropped
++//                          at the DXA, no LMEM byte is written; the barrier is released when the last read returns
++//   bits 31:17  reserved (ignored, as before)
++// SimX only: the RTL ignores these bits (the class tag is simulation-only, like every PhaseShift class mechanism).
++#define DXA_DESC_META_PS_CLASS_LSB   13
++#define DXA_DESC_META_PS_CLASS_BITS  3
++#define DXA_DESC_META_PS_L2ONLY_LSB  16
++#define DXA_DESC_META_PS_L2ONLY_BITS 1
+diff --git a/sw/runtime/include/dxa.h b/sw/runtime/include/dxa.h
+index 6f0a3f426..214f119a9 100644
+--- a/sw/runtime/include/dxa.h
++++ b/sw/runtime/include/dxa.h
+@@ -297,6 +297,23 @@ inline int set_tile_geometry(
+                       (blk_k << 16) | (tcN & 0xffffu));
+ }
+ 
++// PhaseShift (patch dxa-class, docs/methodology.md §14.C): rewrite META with the per-stream class
++// (VX_PS_CLASS_*, 0 = unset = the stock BULK_DXA tag) and the L2-prefetch-only bit (dxa_meta.h, bits 13..16). As
++// set_layout, META is re-packed from scratch: call AFTER program_Nd (and instead of a later set_layout), passing the
++// same rank, elem_bytes and layout. SimX only (the RTL ignores bits 13..31).
++inline int ps_set_stream(
++    vx_device_h dev, uint32_t slot,
++    uint32_t rank, uint32_t elem_bytes, Layout layout,
++    uint32_t ps_class, bool l2_only) {
++  uint32_t dcr  = VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE;
++  uint32_t meta = detail::pack_meta(rank, detail::elem_size_enc(elem_bytes))
++                | ((static_cast<uint32_t>(layout) & ((1u << DXA_DESC_META_LAYOUT_BITS) - 1u))
++                   << DXA_DESC_META_LAYOUT_LSB)
++                | ((ps_class & ((1u << DXA_DESC_META_PS_CLASS_BITS) - 1u)) << DXA_DESC_META_PS_CLASS_LSB)
++                | ((l2_only ? 1u : 0u) << DXA_DESC_META_PS_L2ONLY_LSB);
++  return vx_dcr_write(dev, dcr + VX_DCR_DXA_DESC_META_OFF, meta);
++}
++
+ } // namespace dxa
+ } // namespace vortex
+ 

@@ -1,0 +1,1115 @@
+diff --git a/sim/common/dram_sim.cpp b/sim/common/dram_sim.cpp
+index 584f6f850..1033d7928 100644
+--- a/sim/common/dram_sim.cpp
++++ b/sim/common/dram_sim.cpp
+@@ -12,8 +12,12 @@
+ // limitations under the License.
+ 
+ #include "dram_sim.h"
++#include "ps_dram_b.h"
+ #include "util.h"
+ #include <VX_config.h>
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ #include <deque>
+ #include <fstream>
+ #include <memory>
+@@ -96,6 +100,35 @@ void set_timing(YAML::Node timing, uint32_t data_rate, const clock_timing_t (&bu
+   }
+ }
+ 
++// PhaseShift (patch dram-2class): where do DRAM requests queue? Per channel, sampled once per DRAM clock
++// at the start of Impl::issue() (before the head transaction is offered to Ramulator): the depth of DramSim's own
++// front FIFO `pending_txs` (one entry = one 32 B transaction; a 64 B block is two). ticks = DRAM clocks; busy_ticks =
++// clocks with at least one request of the channel in flight anywhere in the model (inflight > 0), the denominator
++// that ignores idle time; rejects = clocks on which Ramulator refused the head (its read or write buffer was full),
++// accepts = transactions it took. Printed as one PSDRAMQ line per channel by ps_report (PS_DRAM_REPORT=1). Observation
++// only: nothing here is read by the timing model.
++// Percentile of a 1-bucket-per-tick histogram: the smallest w with at least ceil(p * n) samples <= w.
++uint64_t ps_hist_pct(const uint64_t* h, uint32_t nb, uint64_t n, double p) {
++  if (n == 0) return 0;
++  uint64_t need = (uint64_t)(p * (double)n);
++  if ((double)need < p * (double)n) ++need;
++  if (need == 0) need = 1;
++  uint64_t acc = 0;
++  for (uint32_t i = 0; i < nb; ++i) {
++    acc += h[i];
++    if (acc >= need) return i;
++  }
++  return nb - 1;
++}
++
++struct PsFrontQ {
++  uint64_t ticks = 0, busy_ticks = 0, depth_sum = 0, busy_depth_sum = 0, depth_max = 0;
++  uint64_t nonempty_ticks = 0, gt1_ticks = 0, rejects = 0, accepts = 0;
++  // mechanism B at the front (dram_sched != 0): offers of a DEMAND transaction ahead of an older BULK one, and of
++  // the BULK head because its front class wait exceeded W
++  uint64_t demand_first = 0, bulk_aged = 0, bulk_capped = 0;
++};
++
+ }
+ 
+ class DramSim::Impl {
+@@ -111,6 +144,8 @@ private:
+     uint64_t addr;
+     bool is_write;
+     std::shared_ptr<request_t> request;
++    uint32_t cls;   // PhaseShift (patch dram-2class): request class, passed to Ramulator as source_id
++    uint64_t enq;   // PhaseShift (patch dram-2class): channel DRAM clock (PsFrontQ::ticks) when it entered pending_txs
+   };
+ 
+   struct mem_rsp_t {
+@@ -124,10 +159,19 @@ private:
+   struct channel_t {
+     Ramulator::IFrontEnd* frontend;
+     Ramulator::IMemorySystem* memory_system;
+-    std::queue<mem_tx_t> pending_txs;
++    // PhaseShift (patch dram-2class): a deque instead of std::queue so mechanism B can offer an older-class
++    // transaction out of FIFO order (front_pick); with dram_sched = 0 only front()/pop_front() are used (FIFO).
++    std::deque<mem_tx_t> pending_txs;
++    uint64_t last_bulk_accept = 0;   // DRAM clock of the last BULK transaction Ramulator accepted (front aging)
+     std::deque<mem_rsp_t> read_rsps;
+     std::deque<mem_rsp_t> write_rsps;
+     uint32_t inflight;
++    // PhaseShift (patch dram-2class, queue-location measurement; observation only): sampled at every
++    // issue() call, i.e. once per DRAM clock, BEFORE the head transaction is offered to Ramulator.
++    PsFrontQ fq;
++    // PhaseShift (patch dram-2class): mechanism B control + controller counters shared with this channel's
++    // PsTwoClass controller (ps_dram_b.h). channels_ is sized once in the constructor, so the address is stable.
++    vortex::PsDramB b;
+   };
+ 
+   // Each standard moves 32 B per column command (prefetch x channel width).
+@@ -189,7 +233,10 @@ private:
+       set_hbm_device(memory_system["DRAM"], config_);
+     }
+     auto controller = memory_system["Controller"];
+-    controller["impl"] = "Generic";
++    // PhaseShift (patch dram-2class): Ramulator's Generic controller extended with mechanism B (ps_dram_ctrl.cpp);
++    // with dram_sched = 0 it takes every decision the Generic controller takes (no-op regression).
++    controller["impl"] = "PsTwoClass";
++    controller["ps_b"] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&channels_.at(ch).b));
+     controller["Scheduler"]["impl"] = "FRFCFS";
+     // No refresh is modelled: Ramulator's refresh manager refreshes per rank
+     // and these devices have no rank level. GPU controllers hide refresh with
+@@ -254,11 +301,58 @@ private:
+     }
+   }
+ 
++  // PhaseShift (patch dram-2class, methodology §14.B): the transaction mechanism B offers to Ramulator this DRAM
++  // clock (end() = none). Each class stays FIFO; between classes the same rule as inside the controller: the BULK
++  // head first if its front class wait (clocks since the later of its entry and the last BULK accept) exceeds W > 0,
++  // else the oldest DEMAND transaction, else the BULK head; and a BULK transaction is offered only while the
++  // controller holds fewer than bulk_cap BULK requests. Without the class order, BULK transactions that the
++  // controller holds back fill its bounded read buffer and the single FIFO blocks DEMAND behind them (head-of-line
++  // blocking); without the cap, held-back BULK requests still occupy most of the 32 read-buffer slots and DEMAND
++  // keeps only the rest (dev measurement at a quarter of the PS-BASE data rate, results/<run>/README.md).
++  std::deque<mem_tx_t>::iterator front_pick(channel_t& channel) {
++    auto& q = channel.pending_txs;
++    const uint32_t bulk = VX_PS_CLASS_BULK_DXA;
++    auto d = q.end(), k = q.end();
++    for (auto it = q.begin(); it != q.end() && (d == q.end() || k == q.end()); ++it) {
++      if (it->cls == bulk) { if (k == q.end()) k = it; }
++      else if (d == q.end()) d = it;
++    }
++    if (k != q.end() && channel.b.bulk_now >= channel.b.bulk_cap)
++      k = q.end();   // BULK share of the controller buffers is full: BULK waits at the front
++    if (k != q.end() && channel.b.aging > 0 &&
++        channel.fq.ticks - std::max(k->enq, channel.last_bulk_accept) > channel.b.aging) {
++      ++channel.fq.bulk_aged;
++      return k;
++    }
++    if (d != q.end()) {
++      if (k != q.end() && k < d) ++channel.fq.demand_first;
++      return d;
++    }
++    return k;
++  }
++
+   void issue(channel_t& channel) {
++    // PhaseShift (patch dram-2class): front-FIFO depth sample (observation only, see PsFrontQ).
++    {
++      auto& q = channel.fq;
++      const uint64_t d = channel.pending_txs.size();
++      ++q.ticks;
++      q.depth_sum += d;
++      if (d > q.depth_max) q.depth_max = d;
++      if (d > 0) ++q.nonempty_ticks;
++      if (d > 1) ++q.gt1_ticks;
++      if (channel.inflight > 0) { ++q.busy_ticks; q.busy_depth_sum += d; }
++    }
+     if (channel.pending_txs.empty()) {
+       return;
+     }
+-    auto& tx = channel.pending_txs.front();
++    // PhaseShift (patch dram-2class): mechanism B also orders the front FIFO by class (front_pick); stock = head.
++    auto tx_it = (channel.b.mode == 0) ? channel.pending_txs.begin() : this->front_pick(channel);
++    if (tx_it == channel.pending_txs.end()) {
++      ++channel.fq.bulk_capped;   // only BULK waits and its controller share is full
++      return;
++    }
++    auto& tx = *tx_it;
+     auto req_type = tx.is_write ? Ramulator::Request::Type::Write : Ramulator::Request::Type::Read;
+     std::function<void(Ramulator::Request&)> callback = nullptr;
+     if (!tx.is_write) {
+@@ -266,12 +360,19 @@ private:
+         channel.read_rsps.push_back({request, this->cycle_ + 1 + this->config_.latency});
+       };
+     }
+-    if (channel.frontend->receive_external_requests(req_type, tx.addr, 0, callback)) {
++    // PhaseShift (patch dram-2class): the class rides in source_id (stock passed 0; PsTwoClass reads it, its
++    // statistics are sized for the 8 classes).
++    if (channel.frontend->receive_external_requests(req_type, tx.addr, static_cast<int>(tx.cls), callback)) {
+       // Ramulator does not handle write responses, so we handle the callback ourselves.
+       if (tx.is_write) {
+         channel.write_rsps.push_back({tx.request, cycle_});
+       }
+-      channel.pending_txs.pop();
++      if (tx.cls == uint32_t(VX_PS_CLASS_BULK_DXA))
++        channel.last_bulk_accept = channel.fq.ticks;
++      channel.pending_txs.erase(tx_it);   // = pop_front() when tx_it is the head (always with dram_sched = 0)
++      ++channel.fq.accepts;
++    } else {
++      ++channel.fq.rejects;   // Ramulator's read/write buffer was full: the head stays in the front FIFO
+     }
+   }
+ 
+@@ -305,11 +406,56 @@ public:
+     std::cout.rdbuf(original_buf);
+   }
+ 
++  // PhaseShift (patch dram-2class): the queue-location measurement (PsFrontQ), cumulative since construction; one
++  // line per channel (DramSim::ps_report).
++  void ps_report(uint64_t launch) const {
++    for (uint32_t ch = 0; ch < channels_.size(); ++ch) {
++      const auto& q = channels_[ch].fq;
++      std::printf("PSDRAMQ launch=%llu ch=%u dram_ticks=%llu busy_ticks=%llu front_depth_sum=%llu front_depth_mean=%.4f"
++                  " front_depth_mean_busy=%.4f front_depth_max=%llu front_nonempty_ticks=%llu front_gt1_ticks=%llu"
++                  " ram_rejects=%llu ram_accepts=%llu front_demand_first=%llu front_bulk_aged=%llu front_bulk_capped=%llu\n",
++                  (unsigned long long)launch, ch, (unsigned long long)q.ticks, (unsigned long long)q.busy_ticks,
++                  (unsigned long long)q.depth_sum, q.ticks ? double(q.depth_sum) / double(q.ticks) : 0.0,
++                  q.busy_ticks ? double(q.busy_depth_sum) / double(q.busy_ticks) : 0.0,
++                  (unsigned long long)q.depth_max, (unsigned long long)q.nonempty_ticks,
++                  (unsigned long long)q.gt1_ticks, (unsigned long long)q.rejects, (unsigned long long)q.accepts,
++                  (unsigned long long)q.demand_first, (unsigned long long)q.bulk_aged,
++                  (unsigned long long)q.bulk_capped);
++      const auto& b = channels_[ch].b;
++      auto pct = [&](uint32_t c, double p) {
++        return (unsigned long long)ps_hist_pct(b.qwait_hist[c], vortex::PsDramB::kHist, b.qdone[c], p);
++      };
++      std::printf("PSDRAMB launch=%llu ch=%u ticks_m0=%llu ticks_m1=%llu ticks_m2=%llu aging_max=%u ctrl_ticks=%llu"
++                  " busy_ticks=%llu rdq_mean=%.4f rdq_mean_busy=%.4f rdq_bulk_mean=%.4f wrq_mean=%.4f actq_mean=%.4f grants_demand=%llu grants_bulk=%llu bulk_grant_dwait=%llu viol=%llu"
++                  " aged_grants=%llu bwait_max=%llu svc_max=%llu strict_idle=%llu"
++                  " qwait_demand_mean=%.3f qwait_demand_p99=%llu qwait_demand_max=%llu"
++                  " qwait_bulk_mean=%.3f qwait_bulk_p99=%llu qwait_bulk_max=%llu\n",
++                  (unsigned long long)launch, ch, (unsigned long long)b.mode_ticks[0],
++                  (unsigned long long)b.mode_ticks[1], (unsigned long long)b.mode_ticks[2], b.aging_max,
++                  (unsigned long long)b.ticks, (unsigned long long)b.busy_ticks,
++                  b.ticks ? double(b.rdq_occ) / double(b.ticks) : 0.0,
++                  b.busy_ticks ? double(b.rdq_occ) / double(b.busy_ticks) : 0.0,
++                  b.ticks ? double(b.rdq_occ_bulk) / double(b.ticks) : 0.0,
++                  b.ticks ? double(b.wrq_occ) / double(b.ticks) : 0.0,
++                  b.ticks ? double(b.actq_occ) / double(b.ticks) : 0.0,
++                  (unsigned long long)b.grants[0], (unsigned long long)b.grants[1],
++                  (unsigned long long)b.bulk_grant_dwait, (unsigned long long)b.viol,
++                  (unsigned long long)b.aged_grants, (unsigned long long)b.bwait_max, (unsigned long long)b.svc_max,
++                  (unsigned long long)b.strict_idle,
++                  b.qdone[0] ? double(b.qwait_sum[0]) / double(b.qdone[0]) : 0.0, pct(0, 0.99),
++                  (unsigned long long)b.qwait_max[0],
++                  b.qdone[1] ? double(b.qwait_sum[1]) / double(b.qdone[1]) : 0.0, pct(1, 0.99),
++                  (unsigned long long)b.qwait_max[1]);
++    }
++    std::fflush(stdout);
++  }
++
+   void reset() {
+     cycle_ = 0;
+     clock_credit_ = 0;
+     for (auto& channel : channels_) {
+-      channel.pending_txs = std::queue<mem_tx_t>();
++      channel.pending_txs.clear();
++      channel.last_bulk_accept = 0;
+       channel.read_rsps.clear();
+       channel.write_rsps.clear();
+       channel.inflight = 0;
+@@ -336,14 +482,25 @@ public:
+     return (config_.queue_size == 0) || (channels_.at(channel).inflight < config_.queue_size);
+   }
+ 
+-  void send_request(uint32_t channel, uint64_t addr, bool is_write, ResponseCallback response_cb, void* arg) {
++  // PhaseShift (patch dram-2class): mechanism B knobs for every channel (DramSim::set_phase_config).
++  void set_b(uint32_t mode, uint32_t aging, uint32_t bulk_cap) {
++    for (auto& channel : channels_) {
++      channel.b.mode = mode;
++      channel.b.bulk_cap = bulk_cap;
++      channel.b.aging = aging;
++      channel.b.bulk_class = VX_PS_CLASS_BULK_DXA;
++    }
++  }
++
++  void send_request(uint32_t channel, uint64_t addr, bool is_write, ResponseCallback response_cb, void* arg,
++                    uint32_t cls) {
+     // A block wider than a burst is several transactions.
+     uint32_t n = (config_.block_size > tx_size_) ? (config_.block_size / tx_size_) : 1;
+     uint64_t base = addr & ~uint64_t(config_.block_size - 1);
+     auto request = std::make_shared<request_t>(request_t{response_cb, arg, n});
+     auto& ch = channels_.at(channel);
+     for (uint32_t i = 0; i < n; ++i) {
+-      ch.pending_txs.push({dram_addr(base + i * tx_size_), is_write, request});
++      ch.pending_txs.push_back({dram_addr(base + i * tx_size_), is_write, request, cls, ch.fq.ticks});
+     }
+     ++ch.inflight;
+   }
+@@ -394,6 +551,41 @@ void DramSim::reset() {
+   for (auto& n : ps_inflight_) n = 0;
+ }
+ 
++void DramSim::set_phase_config(const PhaseConfig& cfg) {
++  // PhaseShift (patch dram-2class): mechanism B knobs; 0 = stock FR-FCFS, 1 = strict two-class, 2 = work-conserving
++  // two-class (ps_dram_b.h); any other value is reserved and aborts instead of silently doing something else.
++  // dram_sched encoding: bits 1:0 mode (0 FR-FCFS, 1 strict, 2 work-conserving, 3 reserved), bits 15:8 the BULK
++  // slot cap in the controller's read + write buffers (0 = 8; only with mode != 0); every other bit is reserved.
++  const uint32_t v = cfg.dram_sched, mode = v & 0x3, cap = (v >> 8) & 0xff;
++  const char* err = nullptr;
++  if (v & ~0xff03u) err = "reserved bits set";
++  else if (mode == 3) err = "mode 3 is reserved";
++  else if (mode == 0 && cap != 0) err = "a BULK slot cap needs mode 1 or 2";
++  if (err) {
++    std::fprintf(stderr, "Error: [dcr_phase] dram_sched=0x%x rejected: %s (bits 1:0 = 0 FR-FCFS, 1 strict two-class,"
++                 " 2 work-conserving two-class; bits 15:8 = BULK slot cap)\n", v, err);
++    std::fflush(stderr);
++    std::abort();
++  }
++  phase_cfg_ = cfg;
++  impl_->set_b(mode, cfg.dram_aging, cap ? cap : 8);
++}
++
++void DramSim::ps_report(uint64_t launch) const {
++  impl_->ps_report(launch);
++  // End-to-end read residency in the DRAM model per class (DramSim ticks = core cycles; the PsStats interval).
++  for (uint32_t k = 0; k < 2; ++k) {
++    uint64_t n = 0, sum = 0;
++    for (uint32_t i = 0; i < kPsFineBuckets; ++i) { n += ps_rd_fine_[k][i]; sum += ps_rd_fine_[k][i] * i; }
++    std::printf("PSDRAMLAT launch=%llu class=%s reads=%llu mean=%.3f p50=%llu p99=%llu max=%llu%s\n",
++                (unsigned long long)launch, k ? "BULK" : "DEMAND", (unsigned long long)n,
++                n ? double(sum) / double(n) : 0.0, (unsigned long long)ps_hist_pct(ps_rd_fine_[k], kPsFineBuckets, n, 0.5),
++                (unsigned long long)ps_hist_pct(ps_rd_fine_[k], kPsFineBuckets, n, 0.99),
++                (unsigned long long)ps_rd_fine_max_[k], ps_rd_fine_max_[k] >= kPsFineBuckets - 1 ? " (overflow)" : "");
++  }
++  std::fflush(stdout);
++}
++
+ void DramSim::tick() {
+   // PhaseShift (patch ps-counters): occupancy sample at the start of the tick (see PsStats). Observation only.
+   ++ps_cycle_;
+@@ -442,6 +634,10 @@ bool DramSim::ps_on_response(void* a) {
+       d->ps_stats_.rd_wait[c] += w;
+       ++d->ps_stats_.rd_done[c];
+       ++d->ps_stats_.rd_hist[c][ps_log2_bucket(w)];
++      // PhaseShift (patch dram-2class): exact two-class read-residency distribution (ps_report)
++      const uint32_t k = (c == VX_PS_CLASS_BULK_DXA) ? 1 : 0;
++      ++d->ps_rd_fine_[k][w < kPsFineBuckets ? w : kPsFineBuckets - 1];
++      if (w > d->ps_rd_fine_max_[k]) d->ps_rd_fine_max_[k] = w;
+     }
+   }
+   delete t;
+@@ -456,7 +652,7 @@ void DramSim::send_request(uint32_t channel, uint64_t addr, bool is_write, Respo
+   const uint32_t cls = mem_class & (kPsClasses - 1);
+   ++(is_write ? ps_wr_reqs_ : ps_rd_reqs_)[cls];
+   if (callback == nullptr) {
+-    impl_->send_request(channel, addr, is_write, callback, arg);
++    impl_->send_request(channel, addr, is_write, callback, arg, cls);
+     return;
+   }
+   // PhaseShift (patch ps-counters): track the residency through a forwarding callback (see PsStats). Impl calls
+@@ -464,5 +660,5 @@ void DramSim::send_request(uint32_t channel, uint64_t addr, bool is_write, Respo
+   // so the transaction timing and the stall/retry behaviour are unchanged.
+   auto t = new PsTrack{this, callback, arg, ps_cycle_, ps_epoch_, cls, is_write};
+   ++ps_inflight_[cls];
+-  impl_->send_request(channel, addr, is_write, &DramSim::ps_on_response, t);
++  impl_->send_request(channel, addr, is_write, &DramSim::ps_on_response, t, cls);
+ }
+diff --git a/sim/common/dram_sim.h b/sim/common/dram_sim.h
+index eb178d57a..76ff536c5 100644
+--- a/sim/common/dram_sim.h
++++ b/sim/common/dram_sim.h
+@@ -73,7 +73,9 @@ public:
+   }
+ 
+   // PhaseShift (patch dcr-phase): DCR-latched [dcr_phase] config; reset() leaves it alone.
+-  void set_phase_config(const PhaseConfig& cfg) { phase_cfg_ = cfg; }
++  // Patch dram-2class: also hands dram_sched / dram_aging to every channel's controller (mechanism B,
++  // docs/methodology.md §14.B; encoding in dram_sim.cpp); a reserved dram_sched value aborts the simulation.
++  void set_phase_config(const PhaseConfig& cfg);
+   const PhaseConfig& phase_config() const { return phase_cfg_; }
+ 
+   // PhaseShift (patch ps-counters, docs/methodology.md §12.9): per-class residency in the DRAM model, cumulative since
+@@ -95,6 +97,11 @@ public:
+   };
+   const PsStats& ps_stats() const { return ps_stats_; }
+ 
++  // PhaseShift (patch dram-2class, docs/methodology.md §14.B): prints the PSDRAMQ (front-FIFO queue-location
++  // measurement) and PSDRAMB (mechanism B controller counters) lines of every channel to stdout, cumulative since
++  // construction; `launch` only labels them. Called by SimX at the end of every launch when PS_DRAM_REPORT=1.
++  void ps_report(uint64_t launch) const;
++
+ private:
+   class Impl;
+   Impl* impl_;
+@@ -108,6 +115,12 @@ private:
+   PsStats  ps_stats_;
+   uint64_t ps_inflight_[kPsClasses] = {};
+   uint64_t ps_cycle_ = 0;   // DramSim ticks since construction
++  // PhaseShift (patch dram-2class): exact distribution of tracked READ residencies (the PsStats rd_wait interval,
++  // DramSim ticks = core cycles) for [0] DEMAND (every class but BULK_DXA) and [1] BULK, 1-tick buckets, last open;
++  // reported by ps_report (mean / P50 / P99 / max). Observation only.
++  static constexpr uint32_t kPsFineBuckets = 8192;
++  uint64_t ps_rd_fine_[2][kPsFineBuckets] = {};
++  uint64_t ps_rd_fine_max_[2] = {};
+   uint64_t ps_epoch_ = 0;   // bumped by reset(): requests dropped by a reset are not counted when they complete
+ };
+ 
+diff --git a/sim/common/ps_dram_b.h b/sim/common/ps_dram_b.h
+new file mode 100644
+index 000000000..d6da61123
+--- /dev/null
++++ b/sim/common/ps_dram_b.h
+@@ -0,0 +1,51 @@
++// PhaseShift patch dram-2class (semantics in docs/methodology.md §14.B): the state one DRAM channel's
++// two-class controller (PsTwoClass, ps_dram_ctrl.cpp, built into libramulator-vortex.so) shares with DramSim.
++//
++// DramSim owns one PsDramB per channel and hands its address to the controller through the controller's YAML node
++// (key `ps_b`). DramSim writes the control fields whenever the latched [dcr_phase] config changes (host DCR write or
++// PS_SCHEDULE switch); the controller reads them on every tick and writes the counters. Plain data only: this header
++// is compiled both into SimX/RTL simulators (dram_sim.cpp) and into the Ramulator extension library, so it includes
++// neither Vortex nor Ramulator headers.
++//
++// Classes: the Ramulator request's source_id carries the Vortex request class (VX_PS_CLASS_*, patch mem-class);
++// `bulk_class` (= VX_PS_CLASS_BULK_DXA) is BULK, every other class (and source_id -1, e.g. refresh) is DEMAND.
++#pragma once
++
++#include <cstdint>
++
++namespace vortex {
++
++struct PsDramB {
++  // ---- control (DramSim -> controller) ----
++  // mode: 0 = stock FR-FCFS (bit-identical to Ramulator's Generic controller + FRFCFS scheduler);
++  //       1 = two-class STRICT: a BULK request is never granted while a DEMAND request waits in the same buffer,
++  //           unless the BULK class wait exceeds `aging` (then the oldest BULK request is granted first);
++  //       2 = two-class WORK-CONSERVING: as 1, but a ready BULK request may be granted when no DEMAND request (and
++  //           no aged BULK head) is ready this clock.
++  uint32_t mode = 0;
++  uint32_t aging = 0;        // W in DRAM controller clocks; 0 = no aging (pure class priority)
++  int32_t  bulk_class = 4;   // = VX_PS_CLASS_BULK_DXA (set by DramSim)
++  uint32_t bulk_cap = 8;     // mode != 0: DramSim offers a BULK transaction only while fewer than this many BULK
++                             // requests sit in the read + write buffers (dram_sched bits 15:8, 0 = 8 = 1/4 of 32)
++  // ---- controller state read by DramSim ----
++  uint32_t bulk_now = 0;     // BULK requests in the read + write buffers at the end of the last controller clock
++
++  // ---- counters (controller -> DramSim::ps_report); cumulative since construction, every mode ----
++  static constexpr uint32_t kHist = 4096;   // 1-clock buckets of the controller queue wait; the last one is open
++  uint64_t ticks = 0;
++  uint64_t mode_ticks[3] = {};        // controller clocks spent in each mode (a PS_SCHEDULE may switch inside a launch)
++  uint32_t aging_max = 0;             // largest W in force on any clock with mode != 0
++  uint64_t busy_ticks = 0;            // clocks with a request in the read, write or active buffer
++  uint64_t rdq_occ = 0, rdq_occ_bulk = 0, wrq_occ = 0, actq_occ = 0;   // buffer occupancy summed per tick
++  uint64_t grants[2] = {};            // first commands issued from the read/write buffers, [0] DEMAND, [1] BULK
++  uint64_t bulk_grant_dwait = 0;      // BULK grants while a DEMAND request waited in the same buffer
++  uint64_t viol = 0;                  // ... and the BULK class wait was <= W (or W = 0): the strict-mode invariant
++  uint64_t aged_grants = 0;           // BULK grants with BULK class wait > W (aging fired), W > 0 only
++  uint64_t bwait_max = 0;             // max BULK class wait (clocks) at a BULK grant
++  uint64_t svc_max = 0;               // max service time over all requests: final command clock - first command clock
++  uint64_t strict_idle = 0;           // mode 1 clocks with no issue although some read/write-buffer request was ready
++  uint64_t qdone[2] = {}, qwait_sum[2] = {}, qwait_max[2] = {};   // arrive -> final command, per class
++  uint64_t qwait_hist[2][kHist] = {};
++};
++
++}  // namespace vortex
+diff --git a/sim/common/ps_dram_ctrl.cpp b/sim/common/ps_dram_ctrl.cpp
+new file mode 100644
+index 000000000..ba95e7ed0
+--- /dev/null
++++ b/sim/common/ps_dram_ctrl.cpp
+@@ -0,0 +1,596 @@
++// PhaseShift patch dram-2class (semantics, invariants and limits in docs/methodology.md §14.B):
++// the two-class DRAM controller "PsTwoClass" for mechanism B.
++//
++// Built into third_party/ramulator_ext/libramulator-vortex.so next to Ramulator's GDDR6 model (third_party/Makefile),
++// so it registers with Ramulator's factory when the library loads, exactly as that GDDR6 model does; the pinned
++// Ramulator source is not modified. DramSim selects it for every channel (Controller impl "PsTwoClass").
++//
++// Derived from Ramulator 2's GenericDRAMController (third_party/ramulator/src/dram_controller/impl/
++// generic_dram_controller.cpp, MIT License, Copyright (c) 2023 SAFARI Research Group at ETH Zurich and Carnegie Mellon
++// University). With PsDramB::mode == 0 every decision is the Generic controller's: the same buffers, write-mode
++// watermarks, active-buffer-first rule, closing-row check and the configured scheduler (FRFCFS) -- the no-op path.
++// Changes, all marked "PhaseShift":
++//   * the per-source statistics are sized for the 8 request classes that DramSim passes as source_id (Generic sizes
++//     them by the frontend's core count, 1 for the GEM5 frontend, so a class id > 0 would index out of range);
++//   * mode 1/2 replace the scheduler's choice in the read/write buffer by the two-class rule (select_two_class);
++//     the active buffer (requests whose row is already being opened for them) keeps the stock FR-FCFS order in every
++//     mode: those are continuations of requests that were already granted, at most one per bank (methodology §14.B);
++//   * observation-only counters (PsDramB): buffer occupancy, grants per class, the strict-mode invariant counter,
++//     BULK class wait, service times and the per-class controller queue-wait histogram.
++#include <algorithm>
++
++#include "base/base.h"
++#include "dram_controller/controller.h"
++#include "memory_system/memory_system.h"
++
++#include "ps_dram_b.h"
++
++namespace Ramulator {
++
++class PsTwoClassDRAMController final : public IDRAMController, public Implementation {
++  RAMULATOR_REGISTER_IMPLEMENTATION(IDRAMController, PsTwoClassDRAMController, "PsTwoClass",
++                                    "PhaseShift two-class (DEMAND / BULK) DRAM controller (Generic + mechanism B).");
++  private:
++    std::deque<Request> pending;          // A queue for read requests that are about to finish (callback after RL)
++
++    ReqBuffer m_active_buffer;            // Buffer for requests being served. This has the highest priority
++    ReqBuffer m_priority_buffer;          // Buffer for high-priority requests (e.g., maintenance like refresh).
++    ReqBuffer m_read_buffer;              // Read request buffer
++    ReqBuffer m_write_buffer;             // Write request buffer
++
++    int m_bank_addr_idx = -1;
++
++    float m_wr_low_watermark;
++    float m_wr_high_watermark;
++    bool  m_is_write_mode = false;
++
++    size_t s_row_hits = 0;
++    size_t s_row_misses = 0;
++    size_t s_row_conflicts = 0;
++    size_t s_read_row_hits = 0;
++    size_t s_read_row_misses = 0;
++    size_t s_read_row_conflicts = 0;
++    size_t s_write_row_hits = 0;
++    size_t s_write_row_misses = 0;
++    size_t s_write_row_conflicts = 0;
++
++    // PhaseShift: per request class (source_id = VX_PS_CLASS_*, 3 bits) instead of per frontend core.
++    static constexpr size_t kPsSources = 8;
++    size_t m_num_cores = 0;
++    std::vector<size_t> s_read_row_hits_per_core;
++    std::vector<size_t> s_read_row_misses_per_core;
++    std::vector<size_t> s_read_row_conflicts_per_core;
++
++    size_t s_num_read_reqs = 0;
++    size_t s_num_write_reqs = 0;
++    size_t s_num_other_reqs = 0;
++    size_t s_queue_len = 0;
++    size_t s_read_queue_len = 0;
++    size_t s_write_queue_len = 0;
++    size_t s_priority_queue_len = 0;
++    float s_queue_len_avg = 0;
++    float s_read_queue_len_avg = 0;
++    float s_write_queue_len_avg = 0;
++    float s_priority_queue_len_avg = 0;
++
++    size_t s_read_latency = 0;
++    float s_avg_read_latency = 0;
++
++    // PhaseShift: shared state (control + counters), owned by DramSim (ps_dram_b.h).
++    vortex::PsDramB* m_ps = nullptr;
++    vortex::PsDramB  m_ps_local;          // used when no `ps_b` key is given (standalone use)
++    Clk_t m_last_bulk_grant[2] = {0, 0};  // per buffer (0 read, 1 write): clock of the last BULK grant
++
++  public:
++    void init() override {
++      m_wr_low_watermark =  param<float>("wr_low_watermark").desc("Threshold for switching back to read mode.").default_val(0.2f);
++      m_wr_high_watermark = param<float>("wr_high_watermark").desc("Threshold for switching to write mode.").default_val(0.8f);
++      // PhaseShift: address of DramSim's PsDramB for this channel (0 = use a private one, mode 0).
++      uint64_t ps_b = param<uint64_t>("ps_b").desc("PhaseShift: address of the channel's PsDramB.").default_val(0);
++      m_ps = ps_b ? reinterpret_cast<vortex::PsDramB*>(static_cast<uintptr_t>(ps_b)) : &m_ps_local;
++
++      m_scheduler = create_child_ifce<IScheduler>();
++      m_refresh = create_child_ifce<IRefreshManager>();
++      m_rowpolicy = create_child_ifce<IRowPolicy>();
++
++      if (m_config["plugins"]) {
++        YAML::Node plugin_configs = m_config["plugins"];
++        for (YAML::iterator it = plugin_configs.begin(); it != plugin_configs.end(); ++it) {
++          m_plugins.push_back(create_child_ifce<IControllerPlugin>(*it));
++        }
++      }
++    };
++
++    void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
++      m_dram = memory_system->get_ifce<IDRAM>();
++      m_bank_addr_idx = m_dram->m_levels("bank");
++      m_priority_buffer.max_size = 512*3 + 32;
++
++      // PhaseShift: one statistics slot per request class (see kPsSources).
++      m_num_cores = std::max<size_t>(frontend->get_num_cores(), kPsSources);
++
++      s_read_row_hits_per_core.resize(m_num_cores, 0);
++      s_read_row_misses_per_core.resize(m_num_cores, 0);
++      s_read_row_conflicts_per_core.resize(m_num_cores, 0);
++
++      register_stat(s_row_hits).name("row_hits_{}", m_channel_id);
++      register_stat(s_row_misses).name("row_misses_{}", m_channel_id);
++      register_stat(s_row_conflicts).name("row_conflicts_{}", m_channel_id);
++      register_stat(s_read_row_hits).name("read_row_hits_{}", m_channel_id);
++      register_stat(s_read_row_misses).name("read_row_misses_{}", m_channel_id);
++      register_stat(s_read_row_conflicts).name("read_row_conflicts_{}", m_channel_id);
++      register_stat(s_write_row_hits).name("write_row_hits_{}", m_channel_id);
++      register_stat(s_write_row_misses).name("write_row_misses_{}", m_channel_id);
++      register_stat(s_write_row_conflicts).name("write_row_conflicts_{}", m_channel_id);
++
++      for (size_t core_id = 0; core_id < m_num_cores; core_id++) {
++        register_stat(s_read_row_hits_per_core[core_id]).name("read_row_hits_core_{}", core_id);
++        register_stat(s_read_row_misses_per_core[core_id]).name("read_row_misses_core_{}", core_id);
++        register_stat(s_read_row_conflicts_per_core[core_id]).name("read_row_conflicts_core_{}", core_id);
++      }
++
++      register_stat(s_num_read_reqs).name("num_read_reqs_{}", m_channel_id);
++      register_stat(s_num_write_reqs).name("num_write_reqs_{}", m_channel_id);
++      register_stat(s_num_other_reqs).name("num_other_reqs_{}", m_channel_id);
++      register_stat(s_queue_len).name("queue_len_{}", m_channel_id);
++      register_stat(s_read_queue_len).name("read_queue_len_{}", m_channel_id);
++      register_stat(s_write_queue_len).name("write_queue_len_{}", m_channel_id);
++      register_stat(s_priority_queue_len).name("priority_queue_len_{}", m_channel_id);
++      register_stat(s_queue_len_avg).name("queue_len_avg_{}", m_channel_id);
++      register_stat(s_read_queue_len_avg).name("read_queue_len_avg_{}", m_channel_id);
++      register_stat(s_write_queue_len_avg).name("write_queue_len_avg_{}", m_channel_id);
++      register_stat(s_priority_queue_len_avg).name("priority_queue_len_avg_{}", m_channel_id);
++
++      register_stat(s_read_latency).name("read_latency_{}", m_channel_id);
++      register_stat(s_avg_read_latency).name("avg_read_latency_{}", m_channel_id);
++    };
++
++    bool send(Request& req) override {
++      req.final_command = m_dram->m_request_translations(req.type_id);
++
++      switch (req.type_id) {
++        case Request::Type::Read: {
++          s_num_read_reqs++;
++          break;
++        }
++        case Request::Type::Write: {
++          s_num_write_reqs++;
++          break;
++        }
++        default: {
++          s_num_other_reqs++;
++          break;
++        }
++      }
++
++      // Forward existing write requests to incoming read requests
++      if (req.type_id == Request::Type::Read) {
++        auto compare_addr = [req](const Request& wreq) {
++          return wreq.addr == req.addr;
++        };
++        if (std::find_if(m_write_buffer.begin(), m_write_buffer.end(), compare_addr) != m_write_buffer.end()) {
++          // The request will depart at the next cycle
++          req.depart = m_clk + 1;
++          pending.push_back(req);
++          return true;
++        }
++      }
++
++      // Else, enqueue them to corresponding buffer based on request type id
++      bool is_success = false;
++      req.arrive = m_clk;
++      if        (req.type_id == Request::Type::Read) {
++        is_success = m_read_buffer.enqueue(req);
++      } else if (req.type_id == Request::Type::Write) {
++        is_success = m_write_buffer.enqueue(req);
++      } else {
++        throw std::runtime_error("Invalid request type!");
++      }
++      if (!is_success) {
++        // We could not enqueue the request
++        req.arrive = -1;
++        return false;
++      }
++
++      return true;
++    };
++
++    bool priority_send(Request& req) override {
++      req.final_command = m_dram->m_request_translations(req.type_id);
++
++      bool is_success = false;
++      is_success = m_priority_buffer.enqueue(req);
++      return is_success;
++    }
++
++    void tick() override {
++      m_clk++;
++
++      // Update statistics
++      s_queue_len += m_read_buffer.size() + m_write_buffer.size() + m_priority_buffer.size() + pending.size();
++      s_read_queue_len += m_read_buffer.size() + pending.size();
++      s_write_queue_len += m_write_buffer.size();
++      s_priority_queue_len += m_priority_buffer.size();
++
++      // PhaseShift: where requests wait inside the controller (observation only).
++      ps_sample_occupancy();
++
++      // 1. Serve completed reads
++      serve_completed_reads();
++
++      m_refresh->tick();
++
++      // 2. Try to find a request to serve.
++      ReqBuffer::iterator req_it;
++      ReqBuffer* buffer = nullptr;
++      bool request_found = schedule_request(req_it, buffer);
++
++      // 2.1 Take row policy action
++      m_rowpolicy->update(request_found, req_it);
++
++      // 3. Update all plugins
++      for (auto plugin : m_plugins) {
++        plugin->update(request_found, req_it);
++      }
++
++      // 4. Finally, issue the commands to serve the request
++      if (request_found) {
++        // If we find a real request to serve
++        if (req_it->is_stat_updated == false) {
++          // PhaseShift: the request's first command = its grant (observation only).
++          ps_on_grant(req_it, buffer);
++          update_request_stats(req_it);
++        }
++        m_dram->issue_command(req_it->command, req_it->addr_vec);
++
++        // If we are issuing the last command, set depart clock cycle and move the request to the pending queue
++        if (req_it->command == req_it->final_command) {
++          ps_on_final(req_it);   // PhaseShift (observation only)
++          if (req_it->type_id == Request::Type::Read) {
++            req_it->depart = m_clk + m_dram->m_read_latency;
++            pending.push_back(*req_it);
++          } else if (req_it->type_id == Request::Type::Write) {
++            // TODO: Add code to update statistics
++          }
++          buffer->remove(req_it);
++        } else {
++          if (m_dram->m_command_meta(req_it->command).is_opening) {
++            m_active_buffer.enqueue(*req_it);
++            buffer->remove(req_it);
++          }
++        }
++
++      } else if (m_ps->mode == 1) {
++        // PhaseShift: cost of non-work-conservation (observation only).
++        if (ps_any_ready(m_read_buffer) || ps_any_ready(m_write_buffer))
++          ++m_ps->strict_idle;
++      }
++
++      // PhaseShift: BULK occupancy after this clock, for DramSim's front admission (bulk_cap).
++      uint32_t nb = 0;
++      for (auto& r : m_read_buffer) nb += ps_is_bulk(r) ? 1 : 0;
++      for (auto& r : m_write_buffer) nb += ps_is_bulk(r) ? 1 : 0;
++      m_ps->bulk_now = nb;
++
++    };
++
++
++  private:
++    // ------------------------------------------------------------------------------------------------------------
++    // PhaseShift: class helpers and counters
++    bool ps_is_bulk(const Request& r) const { return r.source_id == m_ps->bulk_class; }
++    int ps_cls(const Request& r) const { return ps_is_bulk(r) ? 1 : 0; }
++    int ps_buf_idx(const ReqBuffer* b) const { return (b == &m_write_buffer) ? 1 : 0; }
++
++    void ps_sample_occupancy() {
++      auto& s = *m_ps;
++      ++s.ticks;
++      ++s.mode_ticks[s.mode < 3 ? s.mode : 0];
++      if (s.mode != 0 && s.aging > s.aging_max) s.aging_max = s.aging;
++      if (m_read_buffer.size() + m_write_buffer.size() + m_active_buffer.size() > 0) ++s.busy_ticks;
++      s.rdq_occ += m_read_buffer.size();
++      s.wrq_occ += m_write_buffer.size();
++      s.actq_occ += m_active_buffer.size();
++      for (auto& r : m_read_buffer)
++        if (ps_is_bulk(r)) ++s.rdq_occ_bulk;
++    }
++
++    // Oldest BULK request of a buffer (list order = arrival order: send() appends), or end().
++    ReqBuffer::iterator ps_bulk_head(ReqBuffer& b) {
++      for (auto it = b.begin(); it != b.end(); ++it)
++        if (ps_is_bulk(*it)) return it;
++      return b.end();
++    }
++
++    // BULK class wait of buffer b at the current clock: time since the later of the oldest waiting BULK request's
++    // arrival and the buffer's last BULK grant (the time the BULK class has gone unserved). -1 = no BULK waiting.
++    Clk_t ps_bulk_wait(ReqBuffer& b, ReqBuffer::iterator head) const {
++      if (head == b.end()) return -1;
++      return m_clk - std::max(head->arrive, m_last_bulk_grant[ps_buf_idx(&b)]);
++    }
++
++    bool ps_any_ready(ReqBuffer& b) {
++      for (auto& r : b) {
++        int cmd = m_dram->get_preq_command(r.final_command, r.addr_vec);
++        if (m_dram->check_ready(cmd, r.addr_vec)) return true;
++      }
++      return false;
++    }
++
++    void ps_on_grant(ReqBuffer::iterator& req, ReqBuffer* buffer) {
++      req->scratchpad[0] = static_cast<int>(static_cast<uint32_t>(m_clk));   // grant clock (service time)
++      if (buffer != &m_read_buffer && buffer != &m_write_buffer)
++        return;   // priority-buffer (maintenance) requests carry no class
++      auto& s = *m_ps;
++      const int c = ps_cls(*req);
++      ++s.grants[c];
++      if (c != 1)
++        return;
++      bool dwait = false;
++      for (auto it = buffer->begin(); it != buffer->end(); ++it)
++        if (it != req && !ps_is_bulk(*it)) { dwait = true; break; }
++      const Clk_t bw = ps_bulk_wait(*buffer, ps_bulk_head(*buffer));   // >= 0: req itself is BULK
++      if (static_cast<uint64_t>(bw) > s.bwait_max) s.bwait_max = static_cast<uint64_t>(bw);
++      const bool aged = (s.aging > 0) && bw > static_cast<Clk_t>(s.aging);
++      if (aged) ++s.aged_grants;
++      if (dwait) {
++        ++s.bulk_grant_dwait;
++        if (!aged) ++s.viol;
++      }
++      m_last_bulk_grant[ps_buf_idx(buffer)] = m_clk;
++    }
++
++    void ps_on_final(ReqBuffer::iterator& req) {
++      auto& s = *m_ps;
++      const uint64_t svc = static_cast<uint32_t>(static_cast<uint32_t>(m_clk) -
++                                                 static_cast<uint32_t>(req->scratchpad[0]));
++      if (svc > s.svc_max) s.svc_max = svc;
++      if (req->arrive < 0) return;
++      const int c = ps_cls(*req);
++      const uint64_t w = static_cast<uint64_t>(m_clk - req->arrive);
++      ++s.qdone[c];
++      s.qwait_sum[c] += w;
++      if (w > s.qwait_max[c]) s.qwait_max[c] = w;
++      ++s.qwait_hist[c][std::min<uint64_t>(w, vortex::PsDramB::kHist - 1)];
++    }
++
++    // FR-FCFS among the requests of b that satisfy pred (ready first, then oldest) -- FRFCFS::compare restricted to
++    // a class. req.command must be current (set by select_two_class).
++    template <typename P>
++    ReqBuffer::iterator ps_frfcfs(ReqBuffer& b, P pred) {
++      auto best = b.end();
++      bool best_ready = false;
++      for (auto it = b.begin(); it != b.end(); ++it) {
++        if (!pred(*it)) continue;
++        const bool rdy = m_dram->check_ready(it->command, it->addr_vec);
++        if (best == b.end() || (rdy && !best_ready) || (rdy == best_ready && it->arrive < best->arrive)) {
++          best = it;
++          best_ready = rdy;
++        }
++      }
++      return best;
++    }
++
++    // Mechanism B (methodology §14.B): the request of the read or write buffer to work on this clock.
++    //   aged    = W > 0 and the BULK class wait > W: the oldest BULK request (the BULK head) is chosen first;
++    //   mode 1  = otherwise DEMAND (FR-FCFS among DEMAND) whenever any DEMAND waits, BULK only when none does,
++    //             even if the chosen request is not ready this clock (non-work-conserving);
++    //   mode 2  = otherwise the first READY of: DEMAND (FR-FCFS), BULK (FR-FCFS); if nothing is ready, the head if
++    //             aged, else the DEMAND choice, else the BULK choice.
++    ReqBuffer::iterator select_two_class(ReqBuffer& b) {
++      if (b.size() == 0)
++        return b.end();
++      for (auto& req : b)
++        req.command = m_dram->get_preq_command(req.final_command, req.addr_vec);   // as FRFCFS does
++      auto head = ps_bulk_head(b);
++      const Clk_t bw = ps_bulk_wait(b, head);
++      const bool aged = (m_ps->aging > 0) && bw > static_cast<Clk_t>(m_ps->aging);
++      auto is_dem = [this](const Request& r) { return !ps_is_bulk(r); };
++      auto is_blk = [this](const Request& r) { return ps_is_bulk(r); };
++      if (m_ps->mode == 1) {
++        if (aged) return head;
++        auto d = ps_frfcfs(b, is_dem);
++        return (d != b.end()) ? d : ps_frfcfs(b, is_blk);
++      }
++      auto rdy = [this](ReqBuffer::iterator it) { return m_dram->check_ready(it->command, it->addr_vec); };
++      if (aged && rdy(head)) return head;
++      auto d = ps_frfcfs(b, is_dem);
++      if (d != b.end() && rdy(d)) return d;
++      auto k = ps_frfcfs(b, is_blk);
++      if (k != b.end() && rdy(k)) return k;
++      if (aged) return head;
++      return (d != b.end()) ? d : k;
++    }
++    // ------------------------------------------------------------------------------------------------------------
++
++    /**
++     * @brief    Helper function to check if a request is hitting an open row
++     * @details
++     *
++     */
++    bool is_row_hit(ReqBuffer::iterator& req)
++    {
++        return m_dram->check_rowbuffer_hit(req->final_command, req->addr_vec);
++    }
++    /**
++     * @brief    Helper function to check if a request is opening a row
++     * @details
++     *
++    */
++    bool is_row_open(ReqBuffer::iterator& req)
++    {
++        return m_dram->check_node_open(req->final_command, req->addr_vec);
++    }
++
++    /**
++     * @brief
++     * @details
++     *
++     */
++    void update_request_stats(ReqBuffer::iterator& req)
++    {
++      req->is_stat_updated = true;
++
++      // PhaseShift: source_id is the request class; guard the per-source slot like Generic guards -1.
++      const bool src_ok = req->source_id >= 0 && static_cast<size_t>(req->source_id) < m_num_cores;
++      if (req->type_id == Request::Type::Read)
++      {
++        if (is_row_hit(req)) {
++          s_read_row_hits++;
++          s_row_hits++;
++          if (src_ok)
++            s_read_row_hits_per_core[req->source_id]++;
++        } else if (is_row_open(req)) {
++          s_read_row_conflicts++;
++          s_row_conflicts++;
++          if (src_ok)
++            s_read_row_conflicts_per_core[req->source_id]++;
++        } else {
++          s_read_row_misses++;
++          s_row_misses++;
++          if (src_ok)
++            s_read_row_misses_per_core[req->source_id]++;
++        }
++      }
++      else if (req->type_id == Request::Type::Write)
++      {
++        if (is_row_hit(req)) {
++          s_write_row_hits++;
++          s_row_hits++;
++        } else if (is_row_open(req)) {
++          s_write_row_conflicts++;
++          s_row_conflicts++;
++        } else {
++          s_write_row_misses++;
++          s_row_misses++;
++        }
++      }
++    }
++
++    /**
++     * @brief    Helper function to serve the completed read requests
++     * @details
++     * This function is called at the beginning of the tick() function.
++     * It checks the pending queue to see if the top request has received data from DRAM.
++     * If so, it finishes this request by calling its callback and poping it from the pending queue.
++     */
++    void serve_completed_reads() {
++      if (pending.size()) {
++        // Check the first pending request
++        auto& req = pending[0];
++        if (req.depart <= m_clk) {
++          // Request received data from dram
++          if (req.depart - req.arrive > 1) {
++            // Check if this requests accesses the DRAM or is being forwarded.
++            // TODO add the stats back
++            s_read_latency += req.depart - req.arrive;
++          }
++
++          if (req.callback) {
++            // If the request comes from outside (e.g., processor), call its callback
++            req.callback(req);
++          }
++          // Finally, remove this request from the pending queue
++          pending.pop_front();
++        }
++      };
++    };
++
++
++    /**
++     * @brief    Checks if we need to switch to write mode
++     *
++     */
++    void set_write_mode() {
++      if (!m_is_write_mode) {
++        if ((m_write_buffer.size() > m_wr_high_watermark * m_write_buffer.max_size) || m_read_buffer.size() == 0) {
++          m_is_write_mode = true;
++        }
++      } else {
++        if ((m_write_buffer.size() < m_wr_low_watermark * m_write_buffer.max_size) && m_read_buffer.size() != 0) {
++          m_is_write_mode = false;
++        }
++      }
++    };
++
++
++    /**
++     * @brief    Helper function to find a request to schedule from the buffers.
++     *
++     */
++    bool schedule_request(ReqBuffer::iterator& req_it, ReqBuffer*& req_buffer) {
++      bool request_found = false;
++      // 2.1    First, check the act buffer to serve requests that are already activating (avoid useless ACTs)
++      if (req_it= m_scheduler->get_best_request(m_active_buffer); req_it != m_active_buffer.end()) {
++        if (m_dram->check_ready(req_it->command, req_it->addr_vec)) {
++          request_found = true;
++          req_buffer = &m_active_buffer;
++        }
++      }
++
++      // 2.2    If no requests can be scheduled from the act buffer, check the rest of the buffers
++      if (!request_found) {
++        // 2.2.1    We first check the priority buffer to prioritize e.g., maintenance requests
++        if (m_priority_buffer.size() != 0) {
++          req_buffer = &m_priority_buffer;
++          req_it = m_priority_buffer.begin();
++          req_it->command = m_dram->get_preq_command(req_it->final_command, req_it->addr_vec);
++
++          request_found = m_dram->check_ready(req_it->command, req_it->addr_vec);
++          if (!request_found & m_priority_buffer.size() != 0) {
++            return false;
++          }
++        }
++
++        // 2.2.1    If no request to be scheduled in the priority buffer, check the read and write buffers.
++        if (!request_found) {
++          // Query the write policy to decide which buffer to serve
++          set_write_mode();
++          auto& buffer = m_is_write_mode ? m_write_buffer : m_read_buffer;
++          // PhaseShift: mode 0 = the configured scheduler (stock); mode 1/2 = mechanism B's two-class rule.
++          req_it = (m_ps->mode == 0) ? m_scheduler->get_best_request(buffer) : select_two_class(buffer);
++          if (req_it != buffer.end()) {
++            request_found = m_dram->check_ready(req_it->command, req_it->addr_vec);
++            req_buffer = &buffer;
++          }
++        }
++      }
++
++      // 2.3 If we find a request to schedule, we need to check if it will close an opened row in the active buffer.
++      if (request_found) {
++        if (m_dram->m_command_meta(req_it->command).is_closing) {
++          auto& rowgroup = req_it->addr_vec;
++          for (auto _it = m_active_buffer.begin(); _it != m_active_buffer.end(); _it++) {
++            auto& _it_rowgroup = _it->addr_vec;
++            bool is_matching = true;
++            for (int i = 0; i < m_bank_addr_idx + 1 ; i++) {
++              if (_it_rowgroup[i] != rowgroup[i] && _it_rowgroup[i] != -1 && rowgroup[i] != -1) {
++                is_matching = false;
++                break;
++              }
++            }
++            if (is_matching) {
++              request_found = false;
++              break;
++            }
++          }
++        }
++      }
++
++      return request_found;
++    }
++
++    void finalize() override {
++      s_avg_read_latency = (float) s_read_latency / (float) s_num_read_reqs;
++
++      s_queue_len_avg = (float) s_queue_len / (float) m_clk;
++      s_read_queue_len_avg = (float) s_read_queue_len / (float) m_clk;
++      s_write_queue_len_avg = (float) s_write_queue_len / (float) m_clk;
++      s_priority_queue_len_avg = (float) s_priority_queue_len / (float) m_clk;
++
++      return;
++    }
++
++};
++
++}   // namespace Ramulator
+diff --git a/sim/simx/mem/memory.cpp b/sim/simx/mem/memory.cpp
+index d8e0c57df..7aed76821 100644
+--- a/sim/simx/mem/memory.cpp
++++ b/sim/simx/mem/memory.cpp
+@@ -248,3 +248,7 @@ const DramSim::PsStats& Memory::ps_dram_stats() const {
+ uint64_t Memory::ps_dram_bp(uint32_t cls) const {
+ 	return impl_->ps_dram_bp(cls);
+ }
++
++void Memory::ps_dram_report(uint64_t launch) const {
++	impl_->dram_sim().ps_report(launch);
++}
+diff --git a/sim/simx/mem/memory.h b/sim/simx/mem/memory.h
+index 4b78663bb..bcb27d648 100644
+--- a/sim/simx/mem/memory.h
++++ b/sim/simx/mem/memory.h
+@@ -74,6 +74,9 @@ public:
+ 	const DramSim::PsStats& ps_dram_stats() const;
+ 	uint64_t ps_dram_bp(uint32_t cls) const;
+ 
++	// PhaseShift (patch dram-2class): DramSim::ps_report (PS_DRAM_REPORT=1, end of every launch).
++	void ps_dram_report(uint64_t launch) const;
++
+ protected:
+ 	void on_reset();
+ 	void on_tick();
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index 557f4e582..f5bfd040a 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -196,6 +196,12 @@ ProcessorImpl::ProcessorImpl()
+     const char* e = std::getenv("PS_DUMP_PHASE");
+     phase_dump_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
+   }
++  // PhaseShift (patch dram-2class): PS_DRAM_REPORT=1 prints the PSDRAMQ/PSDRAMB DRAM-model lines (queue location,
++  // mechanism B counters; docs/methodology.md §14.B) at the end of every launch (printing does not change timing).
++  {
++    const char* e = std::getenv("PS_DRAM_REPORT");
++    ps_dram_report_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
++  }
+   // PhaseShift (patch mem-class): PS_DEBUG_CLASS=1 prints the request-class accounting at the end of every launch and
+   // after every cache flush (debug only; counting and printing do not change simulated timing). Also a run-time
+   // check of the MemFlags layout (the compile-time checks are in types.h): mem_class must be bits 21-23.
+@@ -358,6 +364,8 @@ int ProcessorImpl::run() {
+   this->ps_sched_end_launch();   // PhaseShift (patch sched-replay): host config back in force for the flush
+   if (ps_debug_class_)
+     this->ps_class_report("end");
++  if (ps_dram_report_)
++    memsim_->ps_dram_report(phase_launches_ - 1);
+   return exitcode;
+ }
+ 
+diff --git a/sim/simx/processor_impl.h b/sim/simx/processor_impl.h
+index 0900e3b0f..e00eaa706 100644
+--- a/sim/simx/processor_impl.h
++++ b/sim/simx/processor_impl.h
+@@ -168,6 +168,7 @@ private:
+   uint64_t    phase_launches_ = 0;
+   bool        phase_dump_ = false;
+   bool        phase_dump_pending_ = false;
++  bool        ps_dram_report_ = false;   // PhaseShift (patch dram-2class): PS_DRAM_REPORT (read once at construction)
+   bool        ps_debug_class_ = false;   // PhaseShift (patch mem-class): PS_DEBUG_CLASS (read once at construction)
+   // PhaseShift (patch ps-counters)
+   std::unique_ptr<PsTrace> ps_trace_;      // PS_TRACE (read once at construction); null = no trace
+diff --git a/third_party/Makefile b/third_party/Makefile
+index 991f8e7ba..3756b921a 100644
+--- a/third_party/Makefile
++++ b/third_party/Makefile
+@@ -23,7 +23,14 @@ $(RAMULATOR_EXT_DIR)/gddr6.o: ramulator/src/dram/impl/GDDR6.cpp
+ 	mkdir -p $(RAMULATOR_EXT_DIR)
+ 	$(CXX) $(RAMULATOR_EXT_CXXFLAGS) -c $< -o $@
+ 
+-$(RAMULATOR_EXT_DIR)/libramulator-vortex.so: $(RAMULATOR_EXT_DIR)/gddr6.o ramulator/libramulator.so
++# PhaseShift patch dram-2class: mechanism B's two-class controller "PsTwoClass" registers with
++# Ramulator's factory the same way, from the same library (source in sim/common, so it is part of the ps patch).
++PS_DRAM_CTRL_DIR := ../sim/common
++$(RAMULATOR_EXT_DIR)/ps_dram_ctrl.o: $(PS_DRAM_CTRL_DIR)/ps_dram_ctrl.cpp $(PS_DRAM_CTRL_DIR)/ps_dram_b.h
++	mkdir -p $(RAMULATOR_EXT_DIR)
++	$(CXX) $(RAMULATOR_EXT_CXXFLAGS) -I$(PS_DRAM_CTRL_DIR) -c $< -o $@
++
++$(RAMULATOR_EXT_DIR)/libramulator-vortex.so: $(RAMULATOR_EXT_DIR)/gddr6.o $(RAMULATOR_EXT_DIR)/ps_dram_ctrl.o ramulator/libramulator.so
+ 	$(CXX) -shared $(filter %.o,$^) -Lramulator -lramulator -o $@
+ 
+ ramulator: ramulator/libramulator.so $(RAMULATOR_EXT_DIR)/libramulator-vortex.so

@@ -1,0 +1,366 @@
+PhaseShift: L2 tagged next-N-sector stream prefetcher in SimX (per L2 bank).
+Applied ONLY to the sixth tree vortex-trees/pspf (scripts/mk_vortex_tree.sh --patchset ps --name pspf, then `git apply --index` of this file); never part of any patchset.
+Off unless the environment variable PS_PF_DEPTH is non-zero (and then only in the L2, marked by Cluster): with PS_PF_DEPTH unset the bank is bit-identical to the ps patchset (checked: cycles equal the stored psx rows).
+Knobs (environment, read once): PS_PF_DEPTH (sectors per miss trigger = window depth), PS_PF_STEP (sectors per tagged-hit trigger, default 1), PS_PF_QSIZE (candidate queue entries, default 8),
+PS_PF_RESERVE (MSHR entries kept for demand misses, default 4), PS_PF_TRIG (bit 0 = trigger on demand read miss, bit 1 = on first hit of a prefetched sector, default 3).
+Counters (PSPF line per bank at exit): trig_miss trig_hit queued q_drop redundant issued filled useful late unused_evict unused_end poll_evict[class] poll_miss[class].
+Hardware state: 1 tag bit per L2 sector (4096 b at 256 KiB / 64 B sectors), pf + late bit per MSHR entry, a QSIZE-entry candidate queue.
+Design and policy are documented in the block comment of CacheBank (cache.cpp, "patch l2-stream-prefetch").
+
+diff --git a/sim/simx/cluster.cpp b/sim/simx/cluster.cpp
+index d587477bc..4a622fd86 100644
+--- a/sim/simx/cluster.cpp
++++ b/sim/simx/cluster.cpp
+@@ -91,6 +91,8 @@ public:
+     l2cache_->ps_set_persist_capable(true);
+     // PhaseShift (patch kv-insert): mechanism D and its baselines act at the L2 only
+     l2cache_->ps_set_insert_capable(true);
++    // PhaseShift (patch l2-stream-prefetch): the L2 may run the stream prefetcher (off unless PS_PF_DEPTH > 0)
++    l2cache_->ps_set_pf_capable(true);
+     // PhaseShift (patch waymask): the L2 obeys [dcr_phase] l2_waymask (mechanism A2)
+     l2cache_->ps_set_waymask_level(2);
+ 
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+index 838b6556e..816f07985 100644
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -149,6 +149,9 @@ struct sector_t {
+   // PhaseShift (patch mem-class): class of the most recent fill or write of this sector; dirty write-backs carry it
+   // (methodology §12). Instrumentation only: no replacement or timing decision reads it in this patch.
+   uint8_t ps_class = 0;
++  // PhaseShift (patch l2-stream-prefetch): this sector was installed by a prefetch fill and no demand access has
++  // touched it yet (1 bit per sector: the whole hardware tag-state cost of the prefetcher in the data array).
++  bool ps_pf = false;
+ 
+   void reset() {
+     valid = false;
+@@ -156,6 +159,7 @@ struct sector_t {
+     dirty_mask = 0;
+     data.reset();
+     ps_class = 0;
++    ps_pf = false;
+   }
+ };
+ 
+@@ -480,6 +484,8 @@ struct bank_req_t {
+   // the core response was already sent at miss time, so Replay must not
+   // emit another response — only run sector_merge.
+   bool skip_core_rsp;
++  // PhaseShift (patch l2-stream-prefetch): bank-generated prefetch read; it never answers a core (no response).
++  bool pf = false;
+ 
+   // TLM data:
+   //   For Core writes: incoming write data + byteen.
+@@ -520,6 +526,7 @@ struct bank_req_t {
+     write = false;
+     op = MemOp::LD;
+     skip_core_rsp = false;
++    pf = false;
+     data.reset();
+     byteen = 0;
+     amo_cmp = 0;
+@@ -549,6 +556,9 @@ struct mshr_entry_t {
+   // PhaseShift (patch mem-class): priority of the entry's (set,tag,sector) chain = max over its requesters of
+   // ps_class_prio(class) (methodology §12); kept equal in every entry of the chain. Not read by timing yet.
+   uint8_t ps_chain_prio;
++  // PhaseShift (patch l2-stream-prefetch): a demand request joined this (prefetch-rooted) chain before its fill
++  // returned = the prefetch was LATE (useful, but did not hide the whole latency).
++  bool pf_late = false;
+ 
+   mshr_entry_t() {
+     this->reset();
+@@ -562,6 +572,7 @@ struct mshr_entry_t {
+     line_id = 0;
+     seq = 0;
+     ps_chain_prio = 0;
++    pf_late = false;
+   }
+ };
+ 
+@@ -670,6 +681,8 @@ public:
+       }
+       ps_new_prio_ = prio;
+       if (chained) {
++        if (first->bank_req.pf && !bank_req.pf)
++          const_cast<mshr_entry_t*>(first)->pf_late = true;   // PhaseShift (patch l2-stream-prefetch)
+         if (first->bank_req.flags.mem_class != cls)
+           ++ps_stats_.mixed_merges;
+         if (prio > chain_prio)
+@@ -1164,6 +1177,8 @@ protected:
+       }
+     }
+     mshr_.reset();
++    pf_q_.clear();   // PhaseShift (patch l2-stream-prefetch)
++    pf_poll_.clear(); pf_poll_fifo_.clear();
+     fwd_active_ = false;
+     fwd_set_    = 0;
+     fwd_tag_    = 0;
+@@ -1209,6 +1224,8 @@ protected:
+       this->processFlush();
+     }
+ 
++    this->pf_issue();   // PhaseShift (patch l2-stream-prefetch)
++
+     // calculate memory latency
+     perf_stats_.mem_latency += pending_fill_reqs_;
+ 
+@@ -1218,7 +1235,7 @@ protected:
+     // any packet reserved toward core_req_in/mem_rsp_in re-arms on arrival.
+     if (this->core_req_in.size() == 0 && this->mem_rsp_in.size() == 0
+      && pipe_req_->size() == 0 && !mshr_.has_ready_reqs()
+-     && !fwd_active_ && !flushing_ && pending_fill_reqs_ == 0) {
++     && !fwd_active_ && !flushing_ && pending_fill_reqs_ == 0 && pf_q_.empty()) {
+       this->tick_sleep();
+     }
+   }
+@@ -1594,6 +1611,7 @@ private:
+         ++perf_stats_.evictions;
+       }
+ 
++      this->pf_on_evict(victim_line, set_id, mshr_.peek(bank_req.mshr_id).bank_req.pf);   // PhaseShift (patch l2-stream-prefetch)
+       // Repurpose the victim way for the new line: all sectors invalid.
+       ps_victim_age = victim_line.lru_ctr;   // PhaseShift (patch kv-insert): rtl_like_fill keeps the way's state
+       if (ps_repl != 0) {
+@@ -1652,6 +1670,14 @@ private:
+     sec.dirty_mask = 0;
+     sec.data       = bank_req.data;
+     sec.ps_class   = bank_req.flags.mem_class;   // PhaseShift: installed with the fill's class
++    {   // PhaseShift (patch l2-stream-prefetch): a prefetch-rooted fill is tagged unless a demand already joined it
++      const auto &root = mshr_.peek(bank_req.mshr_id);
++      if (root.bank_req.pf) {
++        ++pf_st_.filled;
++        if (root.pf_late) ++pf_st_.late;
++        else sec.ps_pf = true;
++      }
++    }
+     mshr_.replay(bank_req.mshr_id);
+     // arm the fill-forward window for this chain
+     fwd_active_ = true;
+@@ -1678,6 +1704,10 @@ private:
+     if (head == nullptr) {
+       return false;
+     }
++    if (head->bank_req.pf) {   // PhaseShift (patch l2-stream-prefetch): no core response to forward
++      fwd_active_ = false;
++      return false;
++    }
+     if (head->set_id != fwd_set_
+      || head->addr_tag != fwd_tag_
+      || head->sector_id != fwd_sector_
+@@ -1959,6 +1989,10 @@ private:
+     } break;
+ 
+     case bank_req_t::Replay: {
++      if (bank_req.pf) {   // PhaseShift (patch l2-stream-prefetch): the prefetch entry of a filled chain has no requester
++        this->pipe_pop();
++        return;
++      }
+       uint32_t set_id    = params_.addr_set_id(bank_req.addr);
+       uint64_t addr_tag  = params_.addr_tag(bank_req.addr);
+       uint32_t sector_id = params_.addr_sector_id(bank_req.addr);
+@@ -2147,6 +2181,13 @@ private:
+         this->ord_perform(bank_req, "hit");   // PhaseShift (patch cache-ordering, errata 38) (checker)
+ 
+         auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
++        if (hit_sec.ps_pf) {   // PhaseShift (patch l2-stream-prefetch): first demand touch of a prefetched sector
++          hit_sec.ps_pf = false;
++          if (!bank_req.write) {
++            ++pf_st_.useful;
++            this->pf_trigger(bank_req.addr, bank_req.flags.mem_class, false);
++          }
++        }
+         if (bank_req.write) {
+           sector_merge(hit_sec, bank_req.data, bank_req.byteen);
+           hit_sec.ps_class = bank_req.flags.mem_class;   // PhaseShift: last writer's class
+@@ -2231,6 +2272,10 @@ private:
+           assert(!mshr_.full());
+           int mshr_id = mshr_.enqueue(bank_req, set_id, addr_tag, sector_id);
+           DT(3, this->name() << " mshr-enqueue: " << bank_req);
++          if (!fill_pending && !bank_req.write && !memop_is_atomic(bank_req.op)) {   // PhaseShift (patch l2-stream-prefetch)
++            this->pf_check_poll(bank_req.addr, bank_req.flags.mem_class);
++            this->pf_trigger(bank_req.addr, bank_req.flags.mem_class, true);
++          }
+           if (!fill_pending) {
+             MemReq fill;
+             fill.addr  = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
+@@ -2449,6 +2494,148 @@ private:
+               << " live=" << live << std::endl;
+   }
+ 
++
++  // ============================================================================================================
++  // PhaseShift (patch l2-stream-prefetch): L2 tagged next-N-sector stream prefetcher (per bank).
++  //
++  // Policy (all knobs from the environment, read once; PS_PF_DEPTH = 0 or an L2 not marked prefetch-capable = OFF and
++  // the bank is bit-identical to stock):
++  //   * On a demand READ MISS to sector A that allocates a fill, queue A+1 .. A+DEPTH (the next DEPTH sectors of this
++  //     bank in address order: the sector after the last one of a line is the first sector of the next line of this
++  //     bank, i.e. + num_banks lines).  [trigger 1 = PS_PF_TRIG bit 0]
++  //   * On the first demand READ HIT to a sector that a prefetch installed (tag bit ps_pf), queue STEP more sectors
++  //     DEPTH sectors ahead (B+DEPTH .. B+DEPTH+STEP-1), so the window stays DEPTH sectors in front of a
++  //     sequential stream (the classic tagged sequential prefetcher).   [trigger 2 = PS_PF_TRIG bit 1]
++  //   * A queued candidate is issued when the bank has an egress slot and MSHR occupancy (entries + in-pipe requests)
++  //     is below capacity - PS_PF_RESERVE (those slots are kept for demand misses); candidates whose sector is
++  //     resident, in flight or in the bank pipe are dropped ("redundant"). A prefetch is an MSHR-rooted read with no
++  //     requester (bank_req_t::pf): its fill installs the sector tagged ps_pf; no core response is ever sent.
++  // State (hardware cost): 1 tag bit per sector (sector_t::ps_pf) + 1 pf bit and 1 late bit per MSHR entry + a
++  // PS_PF_QSIZE-entry candidate queue (sector address + 3-bit class) + a few counters. No per-stream table.
++  // Counters (cumulative over launches, like the MPM counters; printed as "PSPF" lines when the bank is destroyed):
++  //   issued   fills sent for prefetches          filled  prefetch fills installed
++  //   useful   first demand hit on a prefetched sector = TIMELY prefetches (the data was there before the demand)
++  //   late     a demand joined the prefetch's in-flight chain (useful, but only part of the latency was hidden)
++  //   unused   prefetched sectors evicted (unused_evict) or still resident at exit (unused_end) without a demand touch
++  //   polluting: evictions of valid non-prefetched sectors by prefetch fills (poll_evict, by victim class), and the
++  //            demand misses that hit a recorded such victim afterwards (poll_miss, by the missing request's class;
++  //            bounded 8192-entry record: instrumentation, not hardware)
++  // ============================================================================================================
++  struct pf_cfg_t {
++    uint32_t depth = 0, step = 1, qsize = 8, reserve = 4, trig = 3;
++  };
++  static const pf_cfg_t &pf_cfg() {
++    static pf_cfg_t c = [] {
++      pf_cfg_t x;
++      auto env = [](const char *n, uint32_t d) { const char *e = std::getenv(n); return (e && e[0]) ? (uint32_t)std::strtoul(e, nullptr, 10) : d; };
++      x.depth = env("PS_PF_DEPTH", 0); x.step = env("PS_PF_STEP", 1); x.qsize = env("PS_PF_QSIZE", 8);
++      x.reserve = env("PS_PF_RESERVE", 4); x.trig = env("PS_PF_TRIG", 3);
++      return x;
++    }();
++    return c;
++  }
++  bool pf_on() const { return pf_cfg().depth != 0 && ps_owner_ != nullptr && ps_owner_->ps_pf_capable(); }
++
++  struct pf_ent_t { uint64_t addr; uint8_t cls; };
++  struct pf_stats_t {
++    uint64_t trig_miss = 0, trig_hit = 0, queued = 0, q_drop = 0, redundant = 0, issued = 0, filled = 0, useful = 0, late = 0;
++    uint64_t unused_evict = 0, unused_end = 0, poll_evict[VX_PS_NUM_CLASSES] = {}, poll_miss[VX_PS_NUM_CLASSES] = {};
++  };
++  pf_stats_t pf_st_;
++  std::deque<pf_ent_t> pf_q_;
++  std::unordered_map<uint64_t, uint8_t> pf_poll_;   // sector address -> victim class (bounded FIFO below)
++  std::deque<uint64_t> pf_poll_fifo_;
++
++  uint64_t pf_next(uint64_t addr) const {   // next sector of THIS bank in address order
++    const uint64_t sect = uint64_t(1) << config_.S, line = uint64_t(1) << config_.L, a = addr & ~(sect - 1);
++    const uint32_t sid = params_.addr_sector_id(a);
++    if (sid + 1 < params_.sectors_per_line) return a + sect;
++    return a + sect + (line << config_.B) - line;   // first sector of the line num_banks lines further
++  }
++  void pf_trigger(uint64_t addr, uint32_t cls, bool miss) {
++    if (!pf_on()) return;
++    const pf_cfg_t &c = pf_cfg();
++    if (!(c.trig & (miss ? 1u : 2u))) return;
++    ++(miss ? pf_st_.trig_miss : pf_st_.trig_hit);
++    uint64_t a = addr;
++    uint32_t n = miss ? c.depth : c.step;
++    if (!miss) for (uint32_t i = 0; i < c.depth; ++i) a = pf_next(a);
++    for (uint32_t i = 0; i < n; ++i) {
++      if (miss) a = pf_next(a);
++      if (pf_q_.size() >= c.qsize) { ++pf_st_.q_drop; break; }
++      pf_q_.push_back({a, uint8_t(cls & (VX_PS_NUM_CLASSES - 1))});
++      ++pf_st_.queued;
++      if (!miss) a = pf_next(a);
++    }
++  }
++  void pf_issue() {
++    if (pf_q_.empty() || !pf_on()) return;
++    if (this->mem_req_out.full()) return;
++    if (mshr_.size() + pending_mshr_size_ + pf_cfg().reserve >= mshr_.capacity()) return;
++    const pf_ent_t e = pf_q_.front();
++    pf_q_.pop_front();
++    const uint32_t set_id = params_.addr_set_id(e.addr), sector_id = params_.addr_sector_id(e.addr);
++    const uint64_t tag = params_.addr_tag(e.addr);
++    auto &set = sets_.at(set_id);
++    const int present = set.find_resident(tag);
++    bool red = (present != -1 && set.lines.at(present).sectors.at(sector_id).valid) || mshr_.lookup(set_id, tag, sector_id);
++    for (const auto &pl : pipe_core_lines_) if (pl.first == set_id && pl.second == tag) red = true;
++    if (red) { ++pf_st_.redundant; return; }
++    bank_req_t r;
++    r.reset();
++    r.type = bank_req_t::Core;
++    r.addr = e.addr;
++    r.pf = true;
++    r.adm_seq = adm_seq_ctr_++;
++    r.flags.mem_class = e.cls;
++    const int id = mshr_.enqueue(r, set_id, tag, sector_id);
++    MemReq fill;
++    fill.addr = params_.mem_addr_sector(bank_id_, set_id, tag, sector_id);
++    fill.tag = id;
++    fill.flags.mem_class = e.cls;
++    this->mem_req_out.send(fill, MEM_REQ_DELAY);
++    ++pending_fill_reqs_;
++    ++pf_st_.issued;
++  }
++  // a prefetch fill (fill_is_pf) is about to overwrite `v`: account unused prefetched sectors, record demand victims
++  void pf_on_evict(const line_t &v, uint32_t set_id, bool fill_is_pf) {
++    if (!pf_on()) return;
++    for (uint32_t s = 0; s < v.sectors.size(); ++s) {
++      const auto &sec = v.sectors.at(s);
++      if (!sec.valid) continue;
++      if (sec.ps_pf) { ++pf_st_.unused_evict; continue; }
++      if (!fill_is_pf) continue;
++      const uint64_t key = params_.mem_addr_sector(bank_id_, set_id, v.tag, s);
++      ++pf_st_.poll_evict[sec.ps_class & (VX_PS_NUM_CLASSES - 1)];
++      if (pf_poll_.emplace(key, sec.ps_class).second) {
++        pf_poll_fifo_.push_back(key);
++        if (pf_poll_fifo_.size() > 8192) { pf_poll_.erase(pf_poll_fifo_.front()); pf_poll_fifo_.pop_front(); }
++      }
++    }
++  }
++  void pf_check_poll(uint64_t addr, uint32_t cls) {
++    if (!pf_on() || pf_poll_.empty()) return;
++    const uint64_t key = addr & ~((uint64_t(1) << config_.S) - 1);
++    auto it = pf_poll_.find(key);
++    if (it == pf_poll_.end()) return;
++    ++pf_st_.poll_miss[cls & (VX_PS_NUM_CLASSES - 1)];
++    pf_poll_.erase(it);   // the stale key stays in the FIFO until it ages out; erase() of an absent key is harmless
++  }
++  void pf_report() {
++    if (!pf_on() || (pf_st_.trig_miss + pf_st_.trig_hit) == 0) return;
++    for (auto &set : sets_) for (auto &ln : set.lines) for (auto &sec : ln.sectors) if (sec.valid && sec.ps_pf) ++pf_st_.unused_end;
++    const pf_cfg_t &c = pf_cfg();
++    std::cout << "PSPF bank=" << this->name() << " depth=" << c.depth << " step=" << c.step << " qsize=" << c.qsize << " reserve=" << c.reserve
++              << " trig=" << c.trig << " trig_miss=" << pf_st_.trig_miss << " trig_hit=" << pf_st_.trig_hit << " queued=" << pf_st_.queued
++              << " q_drop=" << pf_st_.q_drop << " redundant=" << pf_st_.redundant << " issued=" << pf_st_.issued << " filled=" << pf_st_.filled
++              << " useful=" << pf_st_.useful << " late=" << pf_st_.late << " unused_evict=" << pf_st_.unused_evict << " unused_end=" << pf_st_.unused_end
++              << " poll_evict=[";
++    for (uint32_t k = 0; k < VX_PS_NUM_CLASSES; ++k) std::cout << (k ? "," : "") << pf_st_.poll_evict[k];
++    std::cout << "] poll_miss=[";
++    for (uint32_t k = 0; k < VX_PS_NUM_CLASSES; ++k) std::cout << (k ? "," : "") << pf_st_.poll_miss[k];
++    std::cout << "]" << std::endl;
++  }
++
+   void pipeLineErase(uint32_t set_id, uint64_t addr_tag) {
+     for (auto it = pipe_core_lines_.begin(); it != pipe_core_lines_.end(); ++it) {
+       if (it->first == set_id && it->second == addr_tag) {
+@@ -2504,7 +2691,7 @@ private:
+ #endif
+ 
+ public:
+-  ~CacheBank() { this->ord_summary("exit"); }   // PhaseShift (patch cache-ordering, errata 38)
++  ~CacheBank() { this->ord_summary("exit"); this->pf_report(); }   // PhaseShift (patch cache-ordering, errata 38)
+ 
+ private:
+   friend class SimObject<CacheBank>;
+diff --git a/sim/simx/mem/cache.h b/sim/simx/mem/cache.h
+index 390762593..25bf87672 100644
+--- a/sim/simx/mem/cache.h
++++ b/sim/simx/mem/cache.h
+@@ -162,6 +162,10 @@ public:
+ 	// PhaseShift (patch kv-insert, methodology §14.D): mechanism D and its baselines act only in a cache
+ 	// marked insert-capable (the L2, Cluster); every other cache sees insert policy 0 (stock). ps_insert() is the
+ 	// policy word in force (PhaseConfig::INS_*).
++	// PhaseShift (patch l2-stream-prefetch): the L2 stream prefetcher acts only in a cache marked prefetch-capable
++	// (the L2, Cluster), and only when the environment variable PS_PF_DEPTH is non-zero (cache.cpp, CacheBank::pf_*).
++	void ps_set_pf_capable(bool v) { ps_pf_capable_ = v; }
++	bool ps_pf_capable() const { return ps_pf_capable_; }
+ 	void ps_set_insert_capable(bool v) { ps_insert_capable_ = v; }
+ 	uint32_t ps_insert() const { return ps_insert_capable_ ? phase_cfg_.insert_policy : 0u; }
+ 
+@@ -185,6 +189,7 @@ private:
+ 	PhaseConfig phase_cfg_;
+ 	bool ps_persist_capable_ = false;   // PhaseShift (patch sched-replay)
+ 	bool ps_insert_capable_ = false;    // PhaseShift (patch kv-insert)
++	bool ps_pf_capable_ = false;        // PhaseShift (patch l2-stream-prefetch)
+ 	uint8_t ps_waymask_level_ = 0;      // PhaseShift (patch waymask)
+ 	uint64_t ps_link_rd_[VX_PS_NUM_CLASSES] = {};   // PhaseShift (patch ps-counters), see ps_count_link_inputs()
+ 	uint64_t ps_link_wr_[VX_PS_NUM_CLASSES] = {};

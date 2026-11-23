@@ -1,0 +1,603 @@
+diff --git a/sim/common/dram_sim.cpp b/sim/common/dram_sim.cpp
+index 1033d7928..9c0a2138f 100644
+--- a/sim/common/dram_sim.cpp
++++ b/sim/common/dram_sim.cpp
+@@ -237,6 +237,7 @@ private:
+     // with dram_sched = 0 it takes every decision the Generic controller takes (no-op regression).
+     controller["impl"] = "PsTwoClass";
+     controller["ps_b"] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&channels_.at(ch).b));
++    controller["ps_ch"] = static_cast<int>(ch);   // PhaseShift (patch b-baselines): BLISS trace file name only
+     controller["Scheduler"]["impl"] = "FRFCFS";
+     // No refresh is modelled: Ramulator's refresh manager refreshes per rank
+     // and these devices have no rank level. GPU controllers hide refresh with
+@@ -347,7 +348,10 @@ private:
+       return;
+     }
+     // PhaseShift (patch dram-2class): mechanism B also orders the front FIFO by class (front_pick); stock = head.
+-    auto tx_it = (channel.b.mode == 0) ? channel.pending_txs.begin() : this->front_pick(channel);
++    // Patch b-baselines: FIFO for FR-FCFS and BLISS (modes 0, 3) and for PADC-lite while the DXA stream is useful;
++    // class order for modes 1/2 and for PADC-lite while it is not (padc_low: mode 1 with W = 0).
++    const bool ordered = (channel.b.mode == 1 || channel.b.mode == 2 || (channel.b.mode == 4 && channel.b.padc_low));
++    auto tx_it = !ordered ? channel.pending_txs.begin() : this->front_pick(channel);
+     if (tx_it == channel.pending_txs.end()) {
+       ++channel.fq.bulk_capped;   // only BULK waits and its controller share is full
+       return;
+@@ -446,6 +450,16 @@ public:
+                   (unsigned long long)b.qwait_max[0],
+                   b.qdone[1] ? double(b.qwait_sum[1]) / double(b.qdone[1]) : 0.0, pct(1, 0.99),
+                   (unsigned long long)b.qwait_max[1]);
++      // PhaseShift (patch b-baselines): the baseline modes' counters (separate line: PSDRAMB stays unchanged)
++      std::printf("PSDRAMX launch=%llu ch=%u ticks_m3=%llu ticks_m4=%llu bliss_thresh=%u bliss_clear=%u"
++                  " bliss_serviced=%llu bliss_bl_events=%llu bliss_clears=%llu bliss_bl_grants=%llu"
++                  " bliss_unsafe_grants=%llu padc_low_ticks=%llu padc_low_viol=%llu\n",
++                  (unsigned long long)launch, ch, (unsigned long long)b.mode_ticks[3],
++                  (unsigned long long)b.mode_ticks[4], b.bliss_thresh, b.bliss_clear,
++                  (unsigned long long)b.bliss_serviced, (unsigned long long)b.bliss_bl_events,
++                  (unsigned long long)b.bliss_clears, (unsigned long long)b.bliss_bl_grants,
++                  (unsigned long long)b.bliss_unsafe_grants, (unsigned long long)b.padc_low_ticks,
++                  (unsigned long long)b.padc_low_viol);
+     }
+     std::fflush(stdout);
+   }
+@@ -483,15 +497,24 @@ public:
+   }
+ 
+   // PhaseShift (patch dram-2class): mechanism B knobs for every channel (DramSim::set_phase_config).
+-  void set_b(uint32_t mode, uint32_t aging, uint32_t bulk_cap) {
++  void set_b(uint32_t mode, uint32_t aging, uint32_t bulk_cap, uint32_t bliss_thresh = 4, uint32_t bliss_clear = 10000) {
+     for (auto& channel : channels_) {
+       channel.b.mode = mode;
++      channel.b.bliss_thresh = bliss_thresh;   // patch b-baselines
++      channel.b.bliss_clear = bliss_clear;
++      if (mode != 4) channel.b.padc_low = 0;
+       channel.b.bulk_cap = bulk_cap;
+       channel.b.aging = aging;
+       channel.b.bulk_class = VX_PS_CLASS_BULK_DXA;
+     }
+   }
+ 
++  // PhaseShift (patch b-baselines): PADC-lite state for every channel.
++  void set_padc_low(bool low) {
++    for (auto& channel : channels_)
++      channel.b.padc_low = low ? 1 : 0;
++  }
++
+   void send_request(uint32_t channel, uint64_t addr, bool is_write, ResponseCallback response_cb, void* arg,
+                     uint32_t cls) {
+     // A block wider than a burst is several transactions.
+@@ -556,9 +579,19 @@ void DramSim::set_phase_config(const PhaseConfig& cfg) {
+   // two-class (ps_dram_b.h); any other value is reserved and aborts instead of silently doing something else.
+   // dram_sched encoding: bits 1:0 mode (0 FR-FCFS, 1 strict, 2 work-conserving, 3 reserved), bits 15:8 the BULK
+   // slot cap in the controller's read + write buffers (0 = 8; only with mode != 0); every other bit is reserved.
+-  const uint32_t v = cfg.dram_sched, mode = v & 0x3, cap = (v >> 8) & 0xff;
++  // Patch b-baselines (methodology §14.B.b): bits 7:4 = baseline policy, used only with bits 1:0 = 0:
++  //   0x?10 BLISS: bits 15:8 = blacklisting threshold T (0 -> 4), dram_aging = clearing interval in controller clocks
++  //         (0 -> 10000);
++  //   0x?20 PADC-lite: bits 15:8 = usefulness threshold theta in percent (0 -> 50), dram_aging = epoch length in
++  //         core cycles (0 -> 10000); BULK slot cap 8 while deprioritised;
++  //   policy values 3..15 are reserved. Strict demand-first (no aging) is mode 1 with dram_aging = 0.
++  const uint32_t v = cfg.dram_sched, mode = v & 0x3, cap = (v >> 8) & 0xff, pol = (v >> 4) & 0xf;
+   const char* err = nullptr;
+-  if (v & ~0xff03u) err = "reserved bits set";
++  if (pol != 0) {
++    if (v & ~0xfff0u) err = "a baseline policy (bits 7:4) needs bits 1:0 = 0 and no bit above 15";
++    else if (pol > 2) err = "baseline policy reserved (bits 7:4: 1 BLISS, 2 PADC-lite)";
++  }
++  else if (v & ~0xff03u) err = "reserved bits set";
+   else if (mode == 3) err = "mode 3 is reserved";
+   else if (mode == 0 && cap != 0) err = "a BULK slot cap needs mode 1 or 2";
+   if (err) {
+@@ -568,11 +601,66 @@ void DramSim::set_phase_config(const PhaseConfig& cfg) {
+     std::abort();
+   }
+   phase_cfg_ = cfg;
+-  impl_->set_b(mode, cfg.dram_aging, cap ? cap : 8);
++  if (pol == 0) {
++    impl_->set_b(mode, cfg.dram_aging, cap ? cap : 8);
++    padc_E_ = 0;
++  } else if (pol == 1) {
++    impl_->set_b(3, 0, 8, cap ? cap : 4, cfg.dram_aging ? cfg.dram_aging : 10000);
++    padc_E_ = 0;
++  } else {
++    const bool was = (padc_E_ != 0);
++    impl_->set_b(4, 0, 8);
++    padc_theta_ = cap ? cap : 50;
++    padc_E_ = cfg.dram_aging ? cfg.dram_aging : 10000;
++    if (!was) {   // entering PADC-lite: start useful (= FR-FCFS) and take the next epoch's counters as the base
++      padc_low_ = false;
++      padc_synced_ = false;
++    }
++    impl_->set_padc_low(padc_low_);
++  }
++}
++
++// PhaseShift (patch b-baselines): PADC-lite usefulness (methodology §14.B.b). SimX calls ps_padc_sync at every launch
++// start and ps_padc_epoch_end every padc_E_ core cycles with the cumulative core LMEM read bytes and DXA bytes.
++void DramSim::ps_padc_sync(uint64_t lmem_rd_bytes, uint64_t dxa_bytes) {
++  padc_l0_ = lmem_rd_bytes;
++  padc_d0_ = dxa_bytes;
++  padc_synced_ = true;
++}
++
++void DramSim::ps_padc_epoch_end(uint64_t cycle, uint64_t lmem_rd_bytes, uint64_t dxa_bytes) {
++  if (padc_E_ == 0) return;
++  if (!padc_synced_ || lmem_rd_bytes < padc_l0_ || dxa_bytes < padc_d0_) {   // no base yet / counters were reset
++    this->ps_padc_sync(lmem_rd_bytes, dxa_bytes);
++    return;
++  }
++  const uint64_t dl = lmem_rd_bytes - padc_l0_, dd = dxa_bytes - padc_d0_;
++  this->ps_padc_sync(lmem_rd_bytes, dxa_bytes);
++  ++padc_epochs_;
++  double u = -1.0;
++  const bool prev = padc_low_;
++  if (dd > 0) {   // an epoch without DXA traffic keeps the previous state (nothing to judge)
++    ++padc_judged_;
++    u = double(dl) / double(dd);
++    padc_low_ = (100.0 * u < double(padc_theta_));
++    if (padc_low_) ++padc_low_epochs_;
++    if (padc_low_ != prev) ++padc_switches_;
++    impl_->set_padc_low(padc_low_);
++  }
++  padc_last_u_ = u;
++  if (padc_trace_)
++    std::printf("PSPADCEP epoch=%llu cycle=%llu lmem_rd_bytes=%llu dxa_bytes=%llu u=%.4f theta=%u low=%d\n",
++                (unsigned long long)padc_epochs_, (unsigned long long)cycle, (unsigned long long)dl,
++                (unsigned long long)dd, u, padc_theta_, padc_low_ ? 1 : 0);
+ }
+ 
+ void DramSim::ps_report(uint64_t launch) const {
+   impl_->ps_report(launch);
++  // PhaseShift (patch b-baselines): PADC-lite epochs (cumulative since construction)
++  std::printf("PSPADC launch=%llu epoch_len=%u theta=%u epochs=%llu judged=%llu low_epochs=%llu switches=%llu low=%d"
++              " last_u=%.4f\n", (unsigned long long)launch, padc_E_, padc_theta_, (unsigned long long)padc_epochs_,
++              (unsigned long long)padc_judged_, (unsigned long long)padc_low_epochs_,
++              (unsigned long long)padc_switches_, padc_low_ ? 1 : 0, padc_last_u_);
+   // End-to-end read residency in the DRAM model per class (DramSim ticks = core cycles; the PsStats interval).
+   for (uint32_t k = 0; k < 2; ++k) {
+     uint64_t n = 0, sum = 0;
+diff --git a/sim/common/dram_sim.h b/sim/common/dram_sim.h
+index 76ff536c5..42d20114b 100644
+--- a/sim/common/dram_sim.h
++++ b/sim/common/dram_sim.h
+@@ -102,7 +102,20 @@ public:
+   // construction; `launch` only labels them. Called by SimX at the end of every launch when PS_DRAM_REPORT=1.
+   void ps_report(uint64_t launch) const;
+ 
++  // PhaseShift (patch b-baselines, docs/methodology.md §14.B.b): PADC-lite. ps_padc_epoch() = the epoch length
++  // in core cycles while dram_sched selects PADC-lite, else 0. The simulator calls ps_padc_sync at every launch start
++  // and ps_padc_epoch_end at the end of every epoch with cumulative counts; usefulness u = delta core LMEM read bytes
++  // / delta DXA bytes of the epoch, and u < theta/100 deprioritises BULK until the next judged epoch.
++  uint32_t ps_padc_epoch() const { return padc_E_; }
++  void ps_padc_sync(uint64_t lmem_rd_bytes, uint64_t dxa_bytes);
++  void ps_padc_epoch_end(uint64_t cycle, uint64_t lmem_rd_bytes, uint64_t dxa_bytes);
++  void ps_padc_set_trace(bool on) { padc_trace_ = on; }
++
+ private:
++  uint32_t padc_E_ = 0, padc_theta_ = 50;
++  bool padc_low_ = false, padc_synced_ = false, padc_trace_ = false;
++  uint64_t padc_l0_ = 0, padc_d0_ = 0, padc_epochs_ = 0, padc_judged_ = 0, padc_low_epochs_ = 0, padc_switches_ = 0;
++  double padc_last_u_ = -1.0;
+   class Impl;
+   Impl* impl_;
+   PhaseConfig phase_cfg_;
+diff --git a/sim/common/ps_dram_b.h b/sim/common/ps_dram_b.h
+index d6da61123..85f2d85de 100644
+--- a/sim/common/ps_dram_b.h
++++ b/sim/common/ps_dram_b.h
+@@ -22,18 +22,29 @@ struct PsDramB {
+   //           unless the BULK class wait exceeds `aging` (then the oldest BULK request is granted first);
+   //       2 = two-class WORK-CONSERVING: as 1, but a ready BULK request may be granted when no DEMAND request (and
+   //           no aged BULK head) is ready this clock.
++  // PhaseShift (patch b-baselines, methodology §14.B.b): the B baselines, same controller:
++  //       3 = BLISS (blacklisting, Subramanian et al. ICCD 2014, port of the pinned Ramulator BLISS plugin +
++  //           scheduler): a source (= request class) serviced more than bliss_thresh times in a row is blacklisted;
++  //           non-blacklisted requests first, then ready, then oldest; every blacklist is cleared each bliss_clear
++  //           controller clocks;
++  //       4 = PADC-lite (Lee et al. MICRO 2008, reduced): BULK (DXA) is treated like DEMAND (stock FR-FCFS) while the
++  //           measured usefulness of the DXA stream is high, and strictly deprioritised (mode 1 with W = 0, front
++  //           order + bulk_cap) while it is low (padc_low, set by DramSim at the end of every epoch).
+   uint32_t mode = 0;
+   uint32_t aging = 0;        // W in DRAM controller clocks; 0 = no aging (pure class priority)
+   int32_t  bulk_class = 4;   // = VX_PS_CLASS_BULK_DXA (set by DramSim)
+   uint32_t bulk_cap = 8;     // mode != 0: DramSim offers a BULK transaction only while fewer than this many BULK
+                              // requests sit in the read + write buffers (dram_sched bits 15:8, 0 = 8 = 1/4 of 32)
++  uint32_t bliss_thresh = 4;      // mode 3: blacklist when the streak of one source exceeds this (0 -> 4)
++  uint32_t bliss_clear = 10000;   // mode 3: clearing interval in controller clocks (0 -> 10000)
++  uint32_t padc_low = 0;          // mode 4: 1 = the DXA stream's last judged usefulness was below the threshold
+   // ---- controller state read by DramSim ----
+   uint32_t bulk_now = 0;     // BULK requests in the read + write buffers at the end of the last controller clock
+ 
+   // ---- counters (controller -> DramSim::ps_report); cumulative since construction, every mode ----
+   static constexpr uint32_t kHist = 4096;   // 1-clock buckets of the controller queue wait; the last one is open
+   uint64_t ticks = 0;
+-  uint64_t mode_ticks[3] = {};        // controller clocks spent in each mode (a PS_SCHEDULE may switch inside a launch)
++  uint64_t mode_ticks[5] = {};        // controller clocks spent in each mode (a PS_SCHEDULE may switch inside a launch)
+   uint32_t aging_max = 0;             // largest W in force on any clock with mode != 0
+   uint64_t busy_ticks = 0;            // clocks with a request in the read, write or active buffer
+   uint64_t rdq_occ = 0, rdq_occ_bulk = 0, wrq_occ = 0, actq_occ = 0;   // buffer occupancy summed per tick
+@@ -46,6 +57,14 @@ struct PsDramB {
+   uint64_t strict_idle = 0;           // mode 1 clocks with no issue although some read/write-buffer request was ready
+   uint64_t qdone[2] = {}, qwait_sum[2] = {}, qwait_max[2] = {};   // arrive -> final command, per class
+   uint64_t qwait_hist[2][kHist] = {};
++  // ---- patch b-baselines counters ----
++  uint64_t bliss_serviced = 0;        // mode 3: read/write requests whose final command issued (the streak events)
++  uint64_t bliss_bl_events = 0;       // mode 3: serviced requests that (re)set their source's blacklist bit
++  uint64_t bliss_clears = 0;          // mode 3: clearing-interval boundaries
++  uint64_t bliss_bl_grants = 0;       // mode 3: grants of a blacklisted-source request
++  uint64_t bliss_unsafe_grants = 0;   // mode 3: ... while a non-blacklisted request waited in the same buffer (must be 0)
++  uint64_t padc_low_ticks = 0;        // mode 4: controller clocks with padc_low = 1
++  uint64_t padc_low_viol = 0;         // mode 4, low: BULK grants while DEMAND waited in the same buffer (must be 0)
+ };
+ 
+ }  // namespace vortex
+diff --git a/sim/common/ps_dram_ctrl.cpp b/sim/common/ps_dram_ctrl.cpp
+index ba95e7ed0..f63a59840 100644
+--- a/sim/common/ps_dram_ctrl.cpp
++++ b/sim/common/ps_dram_ctrl.cpp
+@@ -17,7 +17,23 @@
+ //     mode: those are continuations of requests that were already granted, at most one per bank (methodology §14.B);
+ //   * observation-only counters (PsDramB): buffer occupancy, grants per class, the strict-mode invariant counter,
+ //     BULK class wait, service times and the per-class controller queue-wait histogram.
++//
++// PhaseShift patch b-baselines (methodology §14.B.b): the B baselines are further modes of this same
++// controller, so every policy shares one controller (buffers, watermarks, active-buffer rule, row policy):
++//   * mode 3 = BLISS: a port of the pinned Ramulator BLISS plugin (impl/plugin/bliss/bliss.cpp: streak counter,
++//     blacklist bits, clearing every `unblacklist_cycles`) and BLISSScheduler (impl/scheduler/bliss_scheduler.cpp:
++//     non-blacklisted first, then ready, then oldest, as a left fold over the buffer). The pinned scheduler is an
++//     IBHScheduler that needs the BH controller; here the same rule replaces the read/write-buffer choice (the
++//     active buffer keeps FR-FCFS, as for modes 1/2). Differences from the pinned plugin, all documented in §14.B.b:
++//     the streak counts serviced requests (final RD/WR command) instead of every issued command, and the blacklist
++//     is sized for the 8 classes (the pinned plugin sizes it by the frontend's core count, 1 here);
++//   * mode 4 = PADC-lite: FR-FCFS (the configured scheduler) while padc_low = 0; the strict two-class rule with
++//     W = 0 while padc_low = 1 (DramSim judges the DXA stream's usefulness every epoch and sets padc_low).
+ #include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
+ 
+ #include "base/base.h"
+ #include "dram_controller/controller.h"
+@@ -81,6 +97,16 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+     vortex::PsDramB  m_ps_local;          // used when no `ps_b` key is given (standalone use)
+     Clk_t m_last_bulk_grant[2] = {0, 0};  // per buffer (0 read, 1 write): clock of the last BULK grant
+ 
++    // PhaseShift (patch b-baselines): BLISS state (mode 3), = the pinned plugin's m_blacklist_info /
++    // m_prev_src_id / m_consequtive_src_id (streak - 1).
++    std::array<bool, 8> m_bl{};           // blacklist bit per source (request class)
++    std::array<bool, 8> m_bl_sel{};       // the bits the last BLISS selection used (for the grant counters)
++    int m_bl_prev = -1;
++    int m_bl_consec = 0;
++    FILE* m_bliss_trace = nullptr;        // PS_BLISS_TRACE=<prefix>: <prefix>.<channel> rows (TEST counter trace)
++    bool m_bliss_trace_tried = false;
++    int m_ps_ch = 0;
++
+   public:
+     void init() override {
+       m_wr_low_watermark =  param<float>("wr_low_watermark").desc("Threshold for switching back to read mode.").default_val(0.2f);
+@@ -88,6 +114,9 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+       // PhaseShift: address of DramSim's PsDramB for this channel (0 = use a private one, mode 0).
+       uint64_t ps_b = param<uint64_t>("ps_b").desc("PhaseShift: address of the channel's PsDramB.").default_val(0);
+       m_ps = ps_b ? reinterpret_cast<vortex::PsDramB*>(static_cast<uintptr_t>(ps_b)) : &m_ps_local;
++      // PhaseShift (patch b-baselines): DramSim's channel index (every channel is its own 1-channel Ramulator, so
++      // m_channel_id is 0 everywhere); names the BLISS trace file.
++      m_ps_ch = param<int>("ps_ch").desc("PhaseShift: DramSim channel index.").default_val(0);
+ 
+       m_scheduler = create_child_ifce<IScheduler>();
+       m_refresh = create_child_ifce<IRefreshManager>();
+@@ -232,6 +261,11 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+       for (auto plugin : m_plugins) {
+         plugin->update(request_found, req_it);
+       }
++      // PhaseShift (patch b-baselines): BLISS clearing, where the pinned plugin's update() clears (before the streak
++      // update of this clock's request).
++      int req_it_serviced_src = -1;
++      if (m_ps->mode == 3)
++        ps_bliss_clock();
+ 
+       // 4. Finally, issue the commands to serve the request
+       if (request_found) {
+@@ -246,6 +280,8 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+         // If we are issuing the last command, set depart clock cycle and move the request to the pending queue
+         if (req_it->command == req_it->final_command) {
+           ps_on_final(req_it);   // PhaseShift (observation only)
++          if (req_it->type_id == Request::Type::Read || req_it->type_id == Request::Type::Write)
++            req_it_serviced_src = req_it->source_id;   // PhaseShift (patch b-baselines): BLISS streak event
+           if (req_it->type_id == Request::Type::Read) {
+             req_it->depart = m_clk + m_dram->m_read_latency;
+             pending.push_back(*req_it);
+@@ -266,6 +302,10 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+           ++m_ps->strict_idle;
+       }
+ 
++      // PhaseShift (patch b-baselines): the BLISS streak / blacklist update for a request serviced this clock.
++      if (request_found && m_ps->mode == 3 && req_it_serviced_src >= 0)
++        ps_bliss_serviced(req_it_serviced_src);
++
+       // PhaseShift: BULK occupancy after this clock, for DramSim's front admission (bulk_cap).
+       uint32_t nb = 0;
+       for (auto& r : m_read_buffer) nb += ps_is_bulk(r) ? 1 : 0;
+@@ -285,8 +325,9 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+     void ps_sample_occupancy() {
+       auto& s = *m_ps;
+       ++s.ticks;
+-      ++s.mode_ticks[s.mode < 3 ? s.mode : 0];
+-      if (s.mode != 0 && s.aging > s.aging_max) s.aging_max = s.aging;
++      ++s.mode_ticks[s.mode < 5 ? s.mode : 0];
++      if ((s.mode == 1 || s.mode == 2) && s.aging > s.aging_max) s.aging_max = s.aging;
++      if (s.mode == 4 && s.padc_low) ++s.padc_low_ticks;
+       if (m_read_buffer.size() + m_write_buffer.size() + m_active_buffer.size() > 0) ++s.busy_ticks;
+       s.rdq_occ += m_read_buffer.size();
+       s.wrq_occ += m_write_buffer.size();
+@@ -324,6 +365,14 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+       auto& s = *m_ps;
+       const int c = ps_cls(*req);
+       ++s.grants[c];
++      if (s.mode == 3) {   // PhaseShift (patch b-baselines): BLISS grant counters (selection-time blacklist bits)
++        auto bl = [this](const Request& r) { return r.source_id < 0 || m_bl_sel[r.source_id & 7]; };
++        if (bl(*req)) {
++          ++s.bliss_bl_grants;
++          for (auto it = buffer->begin(); it != buffer->end(); ++it)
++            if (it != req && !bl(*it)) { ++s.bliss_unsafe_grants; break; }
++        }
++      }
+       if (c != 1)
+         return;
+       bool dwait = false;
+@@ -336,6 +385,7 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+       if (dwait) {
+         ++s.bulk_grant_dwait;
+         if (!aged) ++s.viol;
++        if (s.mode == 4 && s.padc_low) ++s.padc_low_viol;   // PhaseShift (patch b-baselines)
+       }
+       m_last_bulk_grant[ps_buf_idx(buffer)] = m_clk;
+     }
+@@ -377,7 +427,8 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+     //             even if the chosen request is not ready this clock (non-work-conserving);
+     //   mode 2  = otherwise the first READY of: DEMAND (FR-FCFS), BULK (FR-FCFS); if nothing is ready, the head if
+     //             aged, else the DEMAND choice, else the BULK choice.
+-    ReqBuffer::iterator select_two_class(ReqBuffer& b) {
++    ReqBuffer::iterator select_two_class(ReqBuffer& b) { return select_two_class(b, m_ps->mode == 1); }
++    ReqBuffer::iterator select_two_class(ReqBuffer& b, bool strict) {
+       if (b.size() == 0)
+         return b.end();
+       for (auto& req : b)
+@@ -387,7 +438,7 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+       const bool aged = (m_ps->aging > 0) && bw > static_cast<Clk_t>(m_ps->aging);
+       auto is_dem = [this](const Request& r) { return !ps_is_bulk(r); };
+       auto is_blk = [this](const Request& r) { return ps_is_bulk(r); };
+-      if (m_ps->mode == 1) {
++      if (strict) {
+         if (aged) return head;
+         auto d = ps_frfcfs(b, is_dem);
+         return (d != b.end()) ? d : ps_frfcfs(b, is_blk);
+@@ -401,6 +452,81 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+       if (aged) return head;
+       return (d != b.end()) ? d : k;
+     }
++
++    // ------------------------------------------------------------------------------------------------------------
++    // PhaseShift (patch b-baselines): BLISS (mode 3) and PADC-lite (mode 4), methodology §14.B.b.
++
++    // The pinned BLISSScheduler::get_best_request + compare: safe (source not blacklisted, or not a read/write) first,
++    // then ready, then FCFS (arrive <=), folded left over the buffer. Every request of the read/write buffers is a
++    // read or a write, so safe = !blacklisted; is_blacklisted(source < 0) = true as in the pinned plugin. The pinned
++    // scheduler keeps safe/ready in scratchpad[0..1]; here they are recomputed (scratchpad[0] holds the grant clock).
++    ReqBuffer::iterator select_bliss(ReqBuffer& b) {
++      if (b.size() == 0)
++        return b.end();
++      m_bl_sel = m_bl;
++      auto safe = [this](const Request& r) { return !(r.source_id < 0 || m_bl[r.source_id & 7]); };
++      for (auto& req : b)
++        req.command = m_dram->get_preq_command(req.final_command, req.addr_vec);
++      auto ready = [this](ReqBuffer::iterator it) { return m_dram->check_ready(it->command, it->addr_vec); };
++      auto cand = b.begin();
++      for (auto next = std::next(b.begin(), 1); next != b.end(); ++next) {
++        const bool s1 = safe(*cand), s2 = safe(*next);
++        if (s1 != s2) { if (!s1) cand = next; continue; }
++        const bool r1 = ready(cand), r2 = ready(next);
++        if (r1 != r2) { if (!r1) cand = next; continue; }
++        if (!(cand->arrive <= next->arrive)) cand = next;
++      }
++      return cand;
++    }
++
++    void ps_bliss_trace_open() {
++      m_bliss_trace_tried = true;
++      const char* p = std::getenv("PS_BLISS_TRACE");
++      if (p == nullptr || p[0] == '\0') return;
++      std::string path = std::string(p) + "." + std::to_string(m_ps_ch);
++      m_bliss_trace = std::fopen(path.c_str(), "w");
++      if (m_bliss_trace) std::fprintf(m_bliss_trace, "# ev,clk,src,streak,bl_after  thresh=%u clear=%u\n",
++                                      m_ps->bliss_thresh, m_ps->bliss_clear);
++    }
++
++    // Pinned plugin update(), first half: clear every blacklist bit when the clock is a multiple of the interval.
++    void ps_bliss_clock() {
++      if (!m_bliss_trace_tried) ps_bliss_trace_open();
++      const uint32_t I = m_ps->bliss_clear ? m_ps->bliss_clear : 10000;
++      if (static_cast<uint64_t>(m_clk) % I == 0) {
++        m_bl.fill(false);
++        ++m_ps->bliss_clears;
++        if (m_bliss_trace) { std::fprintf(m_bliss_trace, "C,%lld,,,\n", static_cast<long long>(m_clk)); std::fflush(m_bliss_trace); }
++      }
++    }
++
++    // Pinned plugin update(), second half, for one serviced request of source src >= 0: the streak counter is
++    // incremented, reset to 0 on a source change, and the source is blacklisted when the counter reaches the
++    // threshold (counter = streak length - 1, so the (T+1)-th consecutive request of one source blacklists it).
++    void ps_bliss_serviced(int src) {
++      ++m_ps->bliss_serviced;
++      const int T = static_cast<int>(m_ps->bliss_thresh ? m_ps->bliss_thresh : 4);
++      m_bl_consec++;
++      if (src != m_bl_prev) {
++        m_bl_prev = src;
++        m_bl_consec = 0;
++      }
++      if (m_bl_consec >= T) {
++        m_bl[src & 7] = true;
++        ++m_ps->bliss_bl_events;
++      }
++      if (m_bliss_trace)
++        std::fprintf(m_bliss_trace, "S,%lld,%d,%d,%d\n", static_cast<long long>(m_clk), src, m_bl_consec + 1,
++                     m_bl[src & 7] ? 1 : 0);
++    }
++
++    // The read/write-buffer choice of the baseline modes.
++    ReqBuffer::iterator ps_baseline_select(ReqBuffer& b) {
++      if (m_ps->mode == 3)
++        return select_bliss(b);
++      // mode 4 (PADC-lite): stock FR-FCFS while the DXA stream is useful; strict two-class (W = 0) while it is not
++      return m_ps->padc_low ? select_two_class(b, true) : m_scheduler->get_best_request(b);
++    }
+     // ------------------------------------------------------------------------------------------------------------
+ 
+     /**
+@@ -548,6 +674,9 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+           set_write_mode();
+           auto& buffer = m_is_write_mode ? m_write_buffer : m_read_buffer;
+           // PhaseShift: mode 0 = the configured scheduler (stock); mode 1/2 = mechanism B's two-class rule.
++          if (m_ps->mode >= 3)   // PhaseShift (patch b-baselines): BLISS / PADC-lite
++            req_it = ps_baseline_select(buffer);
++          else
+           req_it = (m_ps->mode == 0) ? m_scheduler->get_best_request(buffer) : select_two_class(buffer);
+           if (req_it != buffer.end()) {
+             request_found = m_dram->check_ready(req_it->command, req_it->addr_vec);
+@@ -581,6 +710,7 @@ class PsTwoClassDRAMController final : public IDRAMController, public Implementa
+     }
+ 
+     void finalize() override {
++      if (m_bliss_trace) std::fflush(m_bliss_trace);   // PhaseShift (patch b-baselines)
+       s_avg_read_latency = (float) s_read_latency / (float) s_num_read_reqs;
+ 
+       s_queue_len_avg = (float) s_queue_len / (float) m_clk;
+diff --git a/sim/simx/mem/memory.cpp b/sim/simx/mem/memory.cpp
+index 7aed76821..dda9effac 100644
+--- a/sim/simx/mem/memory.cpp
++++ b/sim/simx/mem/memory.cpp
+@@ -252,3 +252,20 @@ uint64_t Memory::ps_dram_bp(uint32_t cls) const {
+ void Memory::ps_dram_report(uint64_t launch) const {
+ 	impl_->dram_sim().ps_report(launch);
+ }
++
++// PhaseShift (patch b-baselines): PADC-lite hooks, forwarded to the DramSim.
++uint32_t Memory::ps_padc_epoch() const {
++	return impl_->dram_sim().ps_padc_epoch();
++}
++
++void Memory::ps_padc_sync(uint64_t lmem_rd_bytes, uint64_t dxa_bytes) {
++	impl_->dram_sim().ps_padc_sync(lmem_rd_bytes, dxa_bytes);
++}
++
++void Memory::ps_padc_epoch_end(uint64_t cycle, uint64_t lmem_rd_bytes, uint64_t dxa_bytes) {
++	impl_->dram_sim().ps_padc_epoch_end(cycle, lmem_rd_bytes, dxa_bytes);
++}
++
++void Memory::ps_padc_set_trace(bool on) {
++	impl_->dram_sim().ps_padc_set_trace(on);
++}
+diff --git a/sim/simx/mem/memory.h b/sim/simx/mem/memory.h
+index bcb27d648..7d225543b 100644
+--- a/sim/simx/mem/memory.h
++++ b/sim/simx/mem/memory.h
+@@ -77,6 +77,12 @@ public:
+ 	// PhaseShift (patch dram-2class): DramSim::ps_report (PS_DRAM_REPORT=1, end of every launch).
+ 	void ps_dram_report(uint64_t launch) const;
+ 
++	// PhaseShift (patch b-baselines): DramSim's PADC-lite hooks (docs/methodology.md §14.B.b).
++	uint32_t ps_padc_epoch() const;
++	void ps_padc_sync(uint64_t lmem_rd_bytes, uint64_t dxa_bytes);
++	void ps_padc_epoch_end(uint64_t cycle, uint64_t lmem_rd_bytes, uint64_t dxa_bytes);
++	void ps_padc_set_trace(bool on);
++
+ protected:
+ 	void on_reset();
+ 	void on_tick();
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index f5bfd040a..f3c92cfb0 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -16,6 +16,7 @@
+ #include "core.h"
+ #include "scheduler.h"
+ #include "socket.h"   // PhaseShift (patch mem-class): PsClassCollect
++#include "local_mem.h"   // PhaseShift (patch b-baselines): PADC-lite core LMEM reads
+ #include <VX_types.h>
+ #ifdef VX_CFG_EXT_RTU_ENABLE
+ #include "rtu_raylog.h"
+@@ -202,6 +203,11 @@ ProcessorImpl::ProcessorImpl()
+     const char* e = std::getenv("PS_DRAM_REPORT");
+     ps_dram_report_ = (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
+   }
++  // PhaseShift (patch b-baselines): PS_PADC_TRACE=1 prints one PSPADCEP line per PADC-lite epoch (TEST trace).
++  {
++    const char* e = std::getenv("PS_PADC_TRACE");
++    memsim_->ps_padc_set_trace(e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
++  }
+   // PhaseShift (patch mem-class): PS_DEBUG_CLASS=1 prints the request-class accounting at the end of every launch and
+   // after every cache flush (debug only; counting and printing do not change simulated timing). Also a run-time
+   // check of the MemFlags layout (the compile-time checks are in types.h): mem_class must be bits 21-23.
+@@ -468,8 +474,36 @@ bool ProcessorImpl::cycle() {
+   return this->any_running();
+ }
+ 
++// PhaseShift (patch b-baselines, methodology §14.B.b): PADC-lite usefulness inputs. Core LMEM reads = LocalMem read
++// requests (one LSU word each) summed over cores; DXA bytes = the dxa_bytes_s<k> counters (one L1 line per DXA
++// GMEM read; every DXA read here lands in LMEM), summed over streams. Both cumulative; read-only.
++void ProcessorImpl::ps_padc_counts(uint64_t& lmem_rd_bytes, uint64_t& dxa_bytes) const {
++  lmem_rd_bytes = 0;
++  for (auto core : ps_cores_)
++    lmem_rd_bytes += core->local_mem()->perf_stats().reads * LSU_WORD_SIZE;
++  PsClassCollect col;
++  for (auto& cluster : clusters_)
++    cluster->ps_collect(col);
++  dxa_bytes = 0;
++  for (uint32_t s = 0; s < VX_PS_DXA_STREAMS; ++s)
++    dxa_bytes += col.dxa_bytes[s];
++}
++
++void ProcessorImpl::ps_padc_epoch_end() {
++  uint64_t l, d;
++  this->ps_padc_counts(l, d);
++  memsim_->ps_padc_epoch_end(SimPlatform::instance().cycles(), l, d);
++}
++
+ void ProcessorImpl::phase_begin_launch() {
+   ++phase_launches_;
++  // PhaseShift (patch b-baselines): PADC-lite epochs restart with every launch (counter base re-taken)
++  ps_padc_cnt_ = 0;
++  if (memsim_->ps_padc_epoch() != 0) {
++    uint64_t l, d;
++    this->ps_padc_counts(l, d);
++    memsim_->ps_padc_sync(l, d);
++  }
+   if (phase_cfg_.persist_l2())
+     ++ps_persist_launches_;   // PhaseShift (patch sched-replay)
+   phase_dump_pending_ = phase_dump_;
+diff --git a/sim/simx/processor_impl.h b/sim/simx/processor_impl.h
+index e00eaa706..522248e65 100644
+--- a/sim/simx/processor_impl.h
++++ b/sim/simx/processor_impl.h
+@@ -118,6 +118,11 @@ private:
+   uint64_t ps_work_in(bool instrs) const;   // per-launch work counter: retired instructions (true) or ps_mark total
+   uint64_t ps_instrs_total() const;  // retired instructions since construction, summed over cores
+   void ps_trace_after_tick() {
++    // PhaseShift (patch b-baselines): PADC-lite epoch boundary (only while dram_sched selects PADC-lite)
++    if (const uint32_t E = memsim_->ps_padc_epoch(); E != 0 && ++ps_padc_cnt_ >= E) {
++      ps_padc_cnt_ = 0;
++      this->ps_padc_epoch_end();
++    }
+     if (ps_trace_ && ps_trace_->due(this->ps_work()))
+       this->ps_trace_cross();
+     // PhaseShift (patch sched-replay): schedule switches are checked after the trace (a row that closes in the
+@@ -138,6 +143,10 @@ public:
+   bool ps_persist_l2() const { return phase_cfg_.persist_l2(); }
+ private:
+   void ps_trace_cross();
++  // PhaseShift (patch b-baselines): PADC-lite usefulness inputs (cumulative core LMEM read bytes, DXA bytes)
++  void ps_padc_counts(uint64_t& lmem_rd_bytes, uint64_t& dxa_bytes) const;
++  void ps_padc_epoch_end();
++  uint32_t ps_padc_cnt_ = 0;   // core cycles since the last PADC-lite epoch boundary (reset at every launch start)
+   void ps_trace_end_launch();
+   void ps_trace_flush();
+   void ps_restart_max_windows();

@@ -1,0 +1,147 @@
+# knobs.yaml -- PhaseShift knob space K and the reduced ablation set (semantics: docs/methodology.md §14.E).
+# Read by scripts/knobs.py (validate / resolve / write schedules), results/<run>/make_batch.py (experiments/<run>.yaml),
+# scripts/noop_regression.py --all (the P2 kernel list) and, later, (the knob space and the oracle hook).
+#
+# Everything here is AS IMPLEMENTED in ps patches 0001-0013 (vortex-trees/ps); a value outside a knob's `values` is not
+# part of K. Encodings are the SimX ones (sim/common/phase_config.h, sim/common/ps_dram_b.h); the `apply` field says how
+# a knob reaches SimX:
+#   host_arg  an app argument (launch-boundary knob; written by the host into [dcr_phase] / the KMU before launch 0)
+#   schedule  a PS_SCHEDULE line (policy-only knob; may switch inside a launch, methodology §5.1)
+version: 1
+machine: PS-BASE-S1-4c          # experiments/configs.yaml; L1D 16 KiB 4-way, L2 1 MiB 8-way (PLRU), 4 cores, DXA on
+schedule_unit: instrs           # PS_SCHEDULE_UNIT for every schedule written from this file (PS_HINTS=0 builds: no marks)
+
+knobs:
+  A1:
+    what: per-launch LMEM usage through the kernel's key-tile variant (VX_DCR_KMU_LMEM_SIZE follows lmem_bytes)
+    apply: host_arg
+    boundary: launch
+    arg: {ps_decode_attn_gqa: "-t", ps_mixed_attn: "-w"}   # the tile variants (§14.A); other apps: not applicable
+    values: {large: null, small: 16}                        # large = the app default (Tt 32, or the largest Tt <= 32 that fits for dxa)
+    default: large
+  A2:
+    what: allocation way masks <l1word>:<l2word> (bits 15:0 non-WEIGHT fills, bits 31:16 WEIGHT fills; 0 = all ways)
+    apply: host_arg
+    boundary: launch            # needs the post-launch flush (cost ~1,040 cycles); PS_SCHEDULE rejects it
+    arg: "-W"                   # every P2 app (decode, mixed, wkv; added it to the other nine, host side only)
+    values:
+      none: "0x0:0x0"           # = no -W (no DCR write)
+      l2_wgt_half: "0x0:0x00F0000F"      # weights in L2 ways 4-7, every other class in ways 0-3 (P6 "1/2 reserved")
+      l2_wgt_quarter: "0x0:0x00FC0003"   # weights in L2 ways 2-7, others in ways 0-1 (P6 "1/4 reserved" for non-weights)
+      l2_half: "0x0:0xF"
+      l2_quarter: "0x0:0x3"
+      l1_half: "0x3:0x0"
+      l1_quarter: "0x1:0x0"
+      l1_half_l2_wgt_quarter: "0x3:0x00FC0003"
+    default: none
+  B:
+    what: two-class DRAM arbitration in the PsTwoClass Ramulator controller (DEMAND vs BULK_DXA), aging window W
+    apply: schedule
+    fields: [dram_sched, dram_aging]
+    values:
+      frfcfs: {dram_sched: 0, dram_aging: 0}
+      demand_first: {dram_sched: 1, dram_aging: 0}       # strict, no aging (baseline "strict demand-first")
+      strict_w256: {dram_sched: 1, dram_aging: 256}      # "2Q + aging W = 256"
+      strict_w1024: {dram_sched: 1, dram_aging: 1024}
+      wc_w256: {dram_sched: 2, dram_aging: 256}          # work-conserving two-class
+      wc_w1024: {dram_sched: 2, dram_aging: 1024}
+    default: frfcfs
+  C:
+    what: per-class DXA in-flight cap at the DxaCore issue step (dxa_depth<c>; 0 = no cap; >= 8 = no effect)
+    apply: schedule
+    fields: [dxa_depth4]        # class 4 = BULK_DXA, the class of every untagged DXA stream (P2 kernels: -C not used)
+    values: {none: {dxa_depth4: 0}, cap1: {dxa_depth4: 1}, cap2: {dxa_depth4: 2}, cap4: {dxa_depth4: 4}}
+    default: none
+  D:
+    what: KV_STREAM-class L2 insertion (insert bits 1:0; 1 = insert-at-LRU, 2 = bypass); needs the KV range (-R kv)
+    apply: schedule
+    fields: [insert]
+    values: {normal: {insert: 0}, insert_lru: {insert: 1}, bypass: {insert: 2}}
+    default: normal
+    range_arg: {ps_decode_attn_gqa: "-R kv", ps_mixed_attn: "-R kv"}   # apps without it: D is legal but inert (no KV class)
+
+# Phase-ignorant baselines are knobs of K too, used by P6/P7 as comparison rows, not in the reduced set.
+baselines:
+  D_rtl_like_fill: {apply: schedule, set: {insert: 0x10}}
+  D_window: {apply: schedule, set: {insert: 0x100}}
+  D_srrip: {apply: schedule, set: {insert: 0x20}}
+  D_ship: {apply: schedule, set: {insert: 0x40}}
+  B_bliss: {apply: schedule, set: {dram_sched: 0x10, dram_aging: 0}}
+  B_padc: {apply: schedule, set: {dram_sched: 0x20, dram_aging: 0}}
+  C_fdp: {apply: schedule, set: {dxa_fdp: 8192}}
+  A_ucp: {apply: schedule, set: {l2_ucp: 0x8}}
+
+# Exclusivities as implemented (SimX aborts; message substring in `abort`). Checked by scripts/knobs.py before a run.
+exclusive:
+  - {when: "l2 mask != 0 and insert has bits other than 1:0", abort: "exclusive with an L2 insert policy other than D modes 1/2", patch: 0013-compose}
+  - {when: "l2_ucp and l2 mask != 0", abort: "exclusive with a non-zero l2_waymask", patch: 0012-a-baselines}
+  - {when: "l2_ucp and insert != 0", abort: "exclusive with a non-zero L2 insert policy", patch: 0012-a-baselines}
+  - {when: "insert window bit 8 and D bits 1:0", abort: "window baseline and D are exclusive", patch: 0005-kv-insert}
+  - {when: "insert SRRIP/SHiP bits 6:5 and any of D, rtl_like_fill, window", abort: "", patch: 0006-d-baselines}
+  - {when: "dram_sched baseline bits 7:4 with mode bits 1:0", abort: "", patch: 0008-b-baselines}
+  - {when: "any mask or l2_ucp with persist_l2", abort: "persist_l2", patch: 0011-waymask}
+  - {when: "A1 / A2 / persist_l2 in a PS_SCHEDULE", abort: "rejected", patch: 0004-sched-replay}
+
+# The P2 kernels (one cell each; FUNC_APPS of results/<run>/make_batch.py without the micro-benchmarks and the upstream
+# sgemm_tcu_wg_dxa). phase = the launch's phase label used by the per-phase maps below.
+kernels:
+  - {id: decode_gqa, app: ps_decode_attn_gqa, args: "-B 2 -H 8 -K 2 -D 64 -T 64 -v gqa", phase: decode}
+  - {id: decode_dxa, app: ps_decode_attn_gqa, args: "-B 2 -H 8 -K 2 -D 64 -T 64 -v dxa -p 2", phase: decode}
+  - {id: mixed, app: ps_mixed_attn, args: "-H 8 -K 2 -D 64 -c 16 -o 16 -T 64 -n 2", phase: mixed}
+  - {id: prefill_lmem, app: ps_prefill_attn, args: "-B 1 -H 8 -K 2 -D 64 -S 16 -v lmem", phase: prefill}
+  - {id: prefill_dxa, app: ps_prefill_attn, args: "-B 1 -H 8 -K 2 -D 64 -S 16 -v dxa -p 2", phase: prefill}
+  - {id: gemv, app: ps_gemv_f32, args: "-m 512 -n 512 -v lanes", phase: other}
+  - {id: linear, app: ps_linear, args: "-f $PS/build/fixtures/linear/stories15M/L0_M16_P0_matmul_q", phase: other}
+  - {id: softmax, app: ps_softmax_fixed, args: "-r 8 -n 64 -a -5 -b 5 -v warp", phase: other}
+  - {id: rmsnorm, app: ps_rmsnorm, args: "-b 4 -n 512", phase: other}
+  - {id: residual, app: ps_residual, args: "-b 4 -n 512", phase: other}
+  - {id: silu_gate, app: ps_silu_gate, args: "-b 1 -n 1792", phase: other}
+  - {id: rope, app: ps_rope, args: "-b 1 -d 512 -m 128 -H 64 -S 256 -N 1 -l 0", phase: other}
+  - {id: llama, app: ps_llama, args: "-w $PS/data/models/stories260K.bin -T $PS/results/S8/golden_tokens_260K.txt -m tf -n 6 -r $PS/build/fixtures/llama_vx/stories260K_tf32.f32", phase: model}
+
+# Per-phase "on" settings of each mechanism (the phase-aware policy maps; choices and evidence in §14.E). A phase not
+# listed for a mechanism gets that mechanism's default (off). A value is a key of knobs.<M>.values.
+phase_maps:
+  A: {decode: {A1: large, A2: l2_wgt_half}, mixed: {A1: large, A2: l2_wgt_half}, prefill: {A2: l2_wgt_half},
+      other: {A2: l2_wgt_half}, model: {A2: l2_wgt_half}}
+  B: {decode: strict_w256, mixed: strict_w256, other: strict_w256, model: strict_w256}
+  C: {prefill: cap2}
+  D: {decode: bypass, mixed: bypass, model: bypass}
+
+# Phase detectors. ideal = the true phase label of every launch, applied before its first cycle (zero latency, zero
+# error, zero cost). practical = the earlier detector (hook: `source`); exists the placeholder is the phase the host
+# declares for the launch it enqueues (exact for the single-phase P2 launches, so practical == ideal on this matrix).
+detectors:
+  ideal: {source: kernel_label}
+  practical: {source: host_declared, hook: "replaces `source` with the detector's per-launch / per-interval output"}
+
+# The reduced ablation set (proposal ablation matrix). mechanisms = which phase maps are composed.
+ablation:
+  static: {mechanisms: [], detector: none}
+  A: {mechanisms: [A], detector: ideal}
+  B: {mechanisms: [B], detector: ideal}
+  C: {mechanisms: [C], detector: ideal}
+  D: {mechanisms: [D], detector: ideal}
+  A+B: {mechanisms: [A, B], detector: ideal}
+  all-ideal: {mechanisms: [A, B, C, D], detector: ideal}
+  full-practical: {mechanisms: [A, B, C, D], detector: practical}
+  oracle:
+    # The harness hook drives: per-launch A (host args) + a per-interval PS_SCHEDULE for B/C/D, both read from an
+    # oracle file. Without one, `hook_check` is used: a fixed K member different from all-ideal in every
+    # mechanism, with one in-launch switch of every policy knob at half the kernel's static instruction count.
+    mechanisms: [A, B, C, D]
+    detector: oracle
+    oracle_file: null            # path of the DP schedule (mkschedule.py format + `# A: <A1> <A2>` header lines)
+    hook_check:
+      launch: {A1: small, A2: l1_half_l2_wgt_quarter, ranges: true}
+      segments:
+        - {at: 0, B: wc_w1024, C: cap1, D: insert_lru}
+        - {at: half_static_instrs, B: strict_w256, C: cap4, D: bypass}
+      llama_at: 2000             # ps_llama: the work counter restarts every launch; 2,000 instrs fires in most launches
+
+# Exclusivity probes: knob vectors that are illegal BY DESIGN. Every P2 kernel is run with each; the compat cell is
+# `rejected-by-design` iff SimX aborts with the listed message (a PASS would be a harness error).
+probes:
+  x_mask_srrip: {launch: {A2: l2_wgt_half}, set: {insert: 0x20}, abort: "exclusive with an L2 insert policy other than D modes 1/2"}
+  x_mask_ucp: {launch: {A2: l2_wgt_half}, set: {l2_ucp: 0x8}, abort: "exclusive with a non-zero l2_waymask"}
+  x_window_d: {launch: {}, set: {insert: 0x102}, abort: "window baseline and D are exclusive"}

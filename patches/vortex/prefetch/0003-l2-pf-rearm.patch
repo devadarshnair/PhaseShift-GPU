@@ -1,0 +1,112 @@
+PhaseShift: re-arm the L2 stream prefetcher on a late merge. Applies after 0001-l2-stream-prefetch.patch.
+New knob (environment, read once): PS_PF_REARM = D sectors (0 or unset = OFF: the bank is then cycle-identical to the 0001-only design; the prefetcher itself still needs PS_PF_DEPTH > 0).
+When a demand READ joins (detected in MSHR::enqueue, where pf_late is set; it is drained in CacheBank::tick -- the first version hooked the miss path only and never fired, because late joiners enter the MSHR through the admission path) an in-flight prefetch chain whose prefetch has not returned yet (a LATE merge; first joiner of the chain only), queue the sectors that extend the window to P+D,
+P = the prefetched sector joined: the last n = max(PS_PF_STEP, D - PS_PF_DEPTH) sectors up to P+D (D <= DEPTH: just P+D; D = 16 with DEPTH = 8: P+9 .. P+16, so the window stays contiguous).
+Hardware cost beyond 0001: none in storage (pf bit per MSHR entry exists; the late bit is used as a once-per-chain guard); one root lookup on the MSHR-join path and pushes into the existing candidate queue.
+New counters in the PSPF line: rearm (D), rearm_trig, rearm_queued.
+
+diff --git a/sim/simx/mem/cache.cpp b/sim/simx/mem/cache.cpp
+--- a/sim/simx/mem/cache.cpp
++++ b/sim/simx/mem/cache.cpp
+@@ -622,6 +622,19 @@
+     return false;
+   }
+ 
++  // PhaseShift (patch l2-pf-rearm): the oldest entry (lowest seq) of the (set,tag,sector) chain = its root, or nullptr.
++  // PhaseShift (patch l2-pf-rearm): late merges recorded by enqueue(), drained by CacheBank::tick -> pf_rearm
++  std::deque<std::pair<uint64_t, uint8_t>> ps_rearm_q_;
++  const mshr_entry_t *ps_chain_root(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id) const {
++    const mshr_entry_t *first = nullptr;
++    for (const auto &entry : entries_) {
++      if (entry.bank_req.type != bank_req_t::None && entry.set_id == set_id && entry.addr_tag == addr_tag
++       && entry.sector_id == sector_id && (first == nullptr || entry.seq < first->seq))
++        first = &entry;
++    }
++    return first;
++  }
++
+   // True if any matching entry OTHER than exclude_id is still Core-typed,
+   // i.e. the chain's fill hasn't run replay() over it yet. Distinguishes a
+   // fill-pending chain (a plain enqueue will be marked by the fill) from a
+@@ -682,7 +695,9 @@
+       ps_new_prio_ = prio;
+       if (chained) {
+         if (first->bank_req.pf && !bank_req.pf)
+-          const_cast<mshr_entry_t*>(first)->pf_late = true;   // PhaseShift (patch l2-stream-prefetch)
++          { if (!first->pf_late && !bank_req.write && !memop_is_atomic(bank_req.op))   // PhaseShift (patch l2-pf-rearm): record the late merge (first demand joiner of the chain)
++              ps_rearm_q_.push_back({first->bank_req.addr, (uint8_t)bank_req.flags.mem_class});
++            const_cast<mshr_entry_t*>(first)->pf_late = true; }   // PhaseShift (patch l2-stream-prefetch)
+         if (first->bank_req.flags.mem_class != cls)
+           ++ps_stats_.mixed_merges;
+         if (prio > chain_prio)
+@@ -1224,6 +1239,7 @@
+       this->processFlush();
+     }
+ 
++    while (!mshr_.ps_rearm_q_.empty()) { auto e = mshr_.ps_rearm_q_.front(); mshr_.ps_rearm_q_.pop_front(); this->pf_rearm(e.first, e.second); }   // PhaseShift (patch l2-pf-rearm)
+     this->pf_issue();   // PhaseShift (patch l2-stream-prefetch)
+ 
+     // calculate memory latency
+@@ -2522,14 +2538,14 @@
+   //            bounded 8192-entry record: instrumentation, not hardware)
+   // ============================================================================================================
+   struct pf_cfg_t {
+-    uint32_t depth = 0, step = 1, qsize = 8, reserve = 4, trig = 3;
++    uint32_t depth = 0, step = 1, qsize = 8, reserve = 4, trig = 3, rearm = 0;
+   };
+   static const pf_cfg_t &pf_cfg() {
+     static pf_cfg_t c = [] {
+       pf_cfg_t x;
+       auto env = [](const char *n, uint32_t d) { const char *e = std::getenv(n); return (e && e[0]) ? (uint32_t)std::strtoul(e, nullptr, 10) : d; };
+       x.depth = env("PS_PF_DEPTH", 0); x.step = env("PS_PF_STEP", 1); x.qsize = env("PS_PF_QSIZE", 8);
+-      x.reserve = env("PS_PF_RESERVE", 4); x.trig = env("PS_PF_TRIG", 3);
++      x.reserve = env("PS_PF_RESERVE", 4); x.trig = env("PS_PF_TRIG", 3); x.rearm = env("PS_PF_REARM", 0);
+       return x;
+     }();
+     return c;
+@@ -2539,6 +2555,7 @@
+   struct pf_ent_t { uint64_t addr; uint8_t cls; };
+   struct pf_stats_t {
+     uint64_t trig_miss = 0, trig_hit = 0, queued = 0, q_drop = 0, redundant = 0, issued = 0, filled = 0, useful = 0, late = 0;
++    uint64_t rearm_trig = 0, rearm_queued = 0;   // patch l2-pf-rearm
+     uint64_t unused_evict = 0, unused_end = 0, poll_evict[VX_PS_NUM_CLASSES] = {}, poll_miss[VX_PS_NUM_CLASSES] = {};
+   };
+   pf_stats_t pf_st_;
+@@ -2568,6 +2585,28 @@
+       if (!miss) a = pf_next(a);
+     }
+   }
++  // PhaseShift (patch l2-pf-rearm): a demand READ joins an in-flight prefetch chain (a LATE prefetch). Stock
++  // the baseline prefetcher (with or without the 32-entry MSHR) treats this as no trigger at all (the filled sector is installed untagged, so no later tagged hit fires
++  // either), so the stream only advances on demand misses and sits ~1 sector ahead of the consumer. Re-arm: treat the
++  // late merge as a stream trigger and queue the sectors that bring the window to P+REARM, where P is the prefetched
++  // sector joined: the last n = max(STEP, REARM-DEPTH) sectors P+REARM-n+1 .. P+REARM (for REARM <= DEPTH: just P+REARM,
++  // for REARM = 16, DEPTH = 8: P+9 .. P+16 so the window stays contiguous). Redundant candidates are dropped at issue
++  // (pf_issue), so re-triggering costs queue slots only. Once per chain (first joiner). PS_PF_REARM=0 = stock.
++  void pf_rearm(uint64_t paddr, uint32_t cls) {
++    if (!pf_on()) return;
++    const pf_cfg_t &c = pf_cfg();
++    if (c.rearm == 0) return;
++    ++pf_st_.rearm_trig;
++    const uint32_t n = std::max<uint32_t>(c.step, c.rearm > c.depth ? c.rearm - c.depth : 0);
++    uint64_t a = paddr;
++    for (uint32_t i = 0; i < c.rearm - n; ++i) a = pf_next(a);   // a = P + (REARM - n)
++    for (uint32_t i = 0; i < n; ++i) {
++      a = pf_next(a);
++      if (pf_q_.size() >= c.qsize) { ++pf_st_.q_drop; break; }
++      pf_q_.push_back({a, uint8_t(cls & (VX_PS_NUM_CLASSES - 1))});
++      ++pf_st_.queued; ++pf_st_.rearm_queued;
++    }
++  }
+   void pf_issue() {
+     if (pf_q_.empty() || !pf_on()) return;
+     if (this->mem_req_out.full()) return;
+@@ -2626,7 +2665,7 @@
+     for (auto &set : sets_) for (auto &ln : set.lines) for (auto &sec : ln.sectors) if (sec.valid && sec.ps_pf) ++pf_st_.unused_end;
+     const pf_cfg_t &c = pf_cfg();
+     std::cout << "PSPF bank=" << this->name() << " depth=" << c.depth << " step=" << c.step << " qsize=" << c.qsize << " reserve=" << c.reserve
+-              << " trig=" << c.trig << " trig_miss=" << pf_st_.trig_miss << " trig_hit=" << pf_st_.trig_hit << " queued=" << pf_st_.queued
++              << " trig=" << c.trig << " rearm=" << c.rearm << " rearm_trig=" << pf_st_.rearm_trig << " rearm_queued=" << pf_st_.rearm_queued << " trig_miss=" << pf_st_.trig_miss << " trig_hit=" << pf_st_.trig_hit << " queued=" << pf_st_.queued
+               << " q_drop=" << pf_st_.q_drop << " redundant=" << pf_st_.redundant << " issued=" << pf_st_.issued << " filled=" << pf_st_.filled
+               << " useful=" << pf_st_.useful << " late=" << pf_st_.late << " unused_evict=" << pf_st_.unused_evict << " unused_end=" << pf_st_.unused_end
+               << " poll_evict=[";

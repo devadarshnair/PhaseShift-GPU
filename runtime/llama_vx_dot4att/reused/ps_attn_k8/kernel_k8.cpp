@@ -1,0 +1,1 @@
+../../../../kernels/ps_attn_k8/kernel_k8.cpp
