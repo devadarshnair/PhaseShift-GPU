@@ -187,5 +187,5 @@ tinyllamas checkpoints.
 ## Status
 
 Research snapshot. Interfaces, kernel variants and scripts reflect an active study and are not a stable API.
-Prefetcher results are being re-measured after a bookkeeping fix. No license has been chosen yet for the PhaseShift
-code; upstream components keep their own licenses.
+All results are cycle-level simulation (SimX) with synthesis area ratios; see [RESULTS.md](RESULTS.md) for caveats.
+PhaseShift code is released under the Apache-2.0 license; upstream components keep their own licenses.

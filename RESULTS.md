@@ -60,15 +60,28 @@ sign-off flow). For batch-1 decode, the small instruction wins.
 DOT4's GEMV gain grows on narrow warps at short latency: **+313 % at 8 threads** per warp vs **+174 % at 32
 threads** (8 warps). Narrow warps are where a scalar int8 inner loop is most issue-bound.
 
-## 5. L2 stream prefetcher (re-measurement in progress)
+## 5. L2 stream prefetcher with a 32-entry MSHR
 
-An L2 tagged next-N-sector stream prefetcher with a 32-entry MSHR was implemented in SimX
-([`patches/vortex/prefetch/`](patches/vortex/prefetch/)) and evaluated together with DOT4, and combined gains were
-measured. A bookkeeping bug was later found in the prefetcher (the current fix is `0004-pf-late-reset.patch`).
-**The prefetch numbers are being re-measured and are not quoted here.**
+An L2 tagged next-N-sector stream prefetcher plus a 32-entry L2 MSHR
+([`patches/vortex/prefetch/`](patches/vortex/prefetch/)), measured after fixing a bookkeeping bug in the
+prefetcher (`0004-pf-late-reset.patch`; numbers below are from the fixed version).
+
+| | 190-cycle DRAM | 2 cores / 1 channel |
+|---|---|---|
+| GEMV, prefetcher over best software (27 classes, geomean) | +29 % | +24 % |
+| Token decode, DOT4 + prefetcher over best software without it (pos 0 / 128 / 255) | +82 / +43 / +29 % | +57 / +32 / +29 % |
+| Additivity of DOT4 and prefetcher at token 128 (1.0 = they compose) | 1.02 | 0.98 |
+| Extra scheduled DRAM reads vs prefetcher off (token decode) | +18 to +29 % | +16 to +24 % |
+| Prefetched sectors evicted unused (lower bound) | 15-40 % | 21-35 % |
+
+The gain comes from more memory-level parallelism (more outstanding misses plus prefetch issue), not from prefetch
+accuracy: a large share of prefetched data is never used, and the prefetcher costs extra DRAM traffic. A prefetcher
+with the stock 16-entry MSHR gives only about half the GEMV gain (+15 % / +11 %). Re-arming the prefetcher on late
+merges was tested and gave no gain.
 
 ## 6. What did not work
 
+- **Prefetch re-arm on late merge** gave no held-out gain (-0.25 % to -0.03 %) and slowed some classes by up to 7 %. Not adopted.
 - **int8 attention (QK^T with DOT4ACC over an int8 K cache)** did not preserve the greedy token sequence and gave
   only a 3-8 % token-time gain. Not adopted ([`kernels/ps_attn_k8/`](kernels/ps_attn_k8/) is kept for reference).
 
